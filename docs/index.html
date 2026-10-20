@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<title>LinkedIn Blitz</title>
+<meta name="theme-color" content="#05070B">
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="img/favicon-32.png">
+<link rel="apple-touch-icon" href="img/apple-touch-icon.png">
+<link rel="stylesheet" href="theme.css?v=1">
+<link rel="stylesheet" href="blitz.css?v=1">
+<script src="app.js?v=1" defer></script>
+</head>
+<body>
+<!-- Lock screen (same pattern as the meeting-prep dashboard) -->
+<main id="lock" class="lock">
+  <form id="unlock-form" class="lock-card" autocomplete="off">
+    <div class="brand-logo brand-logo--lock" data-logo-slot>
+      <picture><source srcset="img/logo-lock.webp" type="image/webp"><img src="img/logo-lock.png" width="520" height="219" alt="MASTER Intelligence"></picture>
+    </div>
+    <h1>LinkedIn Blitz</h1>
+    <p class="muted">This dashboard is encrypted. Enter your passphrase to unlock.</p>
+    <label class="sr-only" for="pass">Passphrase</label>
+    <div class="pass-row">
+      <input id="pass" type="password" placeholder="Passphrase" autocomplete="current-password" required autofocus>
+      <button id="unlock-btn" class="btn primary" type="submit">Unlock</button>
+    </div>
+    <label class="remember"><input id="remember" type="checkbox"> Keep unlocked in this tab</label>
+    <p id="lock-error" class="error" role="alert" hidden></p>
+    <p class="fine"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg> AES-256-GCM · decrypted in your browser · nothing sent to a server</p>
+  </form>
+</main>
+
+<div id="app" class="app" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo" data-logo-slot>
+        <picture><source srcset="img/logo-header.webp" type="image/webp"><img src="img/logo-header.png" width="264" height="111" alt="MASTER Intelligence"></picture>
+      </div>
+      <div class="brand-meta"><span class="product-label">LinkedIn Blitz</span><span class="brand-sub" id="subtitle"></span></div>
+    </div>
+    <div class="top-actions">
+      <span class="tz-pill" title="All dates shown in Central time">CT · America/Chicago</span>
+      <button id="lock-btn" class="btn ghost" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>Lock</button>
+    </div>
+  </header>
+  <nav class="navbar"><div class="seg nav-seg" id="nav">
+    <a class="seg-btn" href="#/" data-nav="overview">Overview</a>
+    <a class="seg-btn" href="#/briefs" data-nav="briefs">Briefs</a>
+    <a class="seg-btn" href="#/accounts" data-nav="accounts">Contact queue</a>
+    <a class="seg-btn" href="#/needs" data-nav="needs">Needs from Steve<span class="nav-count" id="needs-count"></span></a>
+  </div></nav>
+  <div id="example-banner" class="banner" hidden>EXAMPLE DATA — design preview only. Not real contacts.</div>
+  <main class="content" id="view"></main>
+  <footer class="foot"><span class="tagline">See the signal. Know the next move.</span><span id="foot"></span></footer>
+</div>
+</body>
+</html>

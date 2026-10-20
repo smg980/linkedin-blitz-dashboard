@@ -1,0 +1,49 @@
+/* LinkedIn Blitz components. Uses only the tokens defined in theme.css :root (no one-off colors). */
+.navbar{position:sticky;top:81px;z-index:4;background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.nav-seg{max-width:1120px;margin:0 auto;border:0;background:none;padding:8px 28px;gap:4px;overflow-x:auto}
+.nav-seg .seg-btn{text-decoration:none;white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
+.nav-count{font-size:11px;font-weight:700;color:var(--brand-gold);background:var(--gold-soft);padding:0 6px;border-radius:999px}
+.nav-count:empty{display:none}
+/* status badges (extends .status from theme.css) */
+.status.draft{color:var(--interactive);background:var(--blue-soft);border-color:color-mix(in srgb,var(--interactive) 30%,transparent)}
+.status.approved{color:var(--brand-gold);background:var(--gold-soft);border-color:color-mix(in srgb,var(--brand-gold) 30%,transparent)}
+.status.hold{color:var(--warning);background:var(--warning-soft)}
+.status.next{color:var(--interactive);background:transparent;border-color:color-mix(in srgb,var(--interactive) 40%,transparent)}
+/* hero extras */
+.acct-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px;position:relative;z-index:1}
+.day-ring{position:relative;z-index:1;text-align:center}
+/* schedule */
+.sched{display:grid;gap:0}
+.sched .day{grid-template-columns:120px 1fr}
+.sched .day.today .day-label{color:var(--interactive)}
+.sched-items{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
+.sched-item{display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;background:var(--card-2);text-decoration:none;color:var(--text);transition:.15s}
+a.sched-item:hover{border-color:var(--interactive);background:var(--elevated)}
+.sched-item small{display:block;color:var(--muted);font-size:12px}
+.sched-empty{color:var(--muted);font-size:14px;padding:12px 0}
+/* contact cards */
+.c-card{grid-template-columns:minmax(0,1fr) max-content;text-decoration:none;color:var(--text)}
+a.c-card:hover{border-color:var(--interactive)}
+.c-card .role{color:var(--muted);font-size:14px;margin:4px 0 0}
+.c-meta{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px;font-size:13px;color:var(--brand-silver)}
+.c-meta span{display:inline-flex;gap:6px;align-items:center}.c-meta svg{width:14px;height:14px;color:var(--interactive)}
+.acct-panel + .acct-panel{margin-top:0}
+.acct-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.counts{display:flex;gap:6px;flex-wrap:wrap}
+/* drafts */
+.draft{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--card-2);margin:0 0 12px}
+.draft-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.draft-head h3{margin:0;font-size:15px;flex:1}
+.draft .chars{font-size:12px;color:var(--muted)}
+.draft blockquote{margin:6px 0 0;white-space:pre-wrap}
+.draft .kv-grid{margin-top:10px}
+/* needs */
+.needs{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.needs li{display:grid;grid-template-columns:30px 1fr;gap:12px;background:var(--card-2);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.needs .from{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--interactive);text-decoration:none}
+.needs .q-text ul{margin:6px 0 0;padding-left:18px;color:var(--brand-silver)}
+.doc-card{grid-template-columns:86px minmax(0,1fr) max-content;text-decoration:none;color:var(--text)}
+a.doc-card:hover{border-color:var(--interactive)}
+.filters{margin-bottom:6px}
+@media (max-width:860px){.navbar{position:static}.nav-seg{padding:6px 16px}.sched .day{grid-template-columns:1fr}.c-card,.doc-card{grid-template-columns:1fr}.needs li{grid-template-columns:1fr}}
+@media print{.navbar{display:none!important}}

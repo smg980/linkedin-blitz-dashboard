@@ -1,0 +1,13 @@
+{
+  "name": "linkedin-blitz-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Encrypted static dashboard for a LinkedIn engagement campaign",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:example": "node scripts/build.mjs --example",
+    "serve": "python3 -m http.server 8080 -d docs"
+  },
+  "engines": { "node": ">=20" }
+}

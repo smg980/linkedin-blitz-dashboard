@@ -1,0 +1,8 @@
+# Never commit plaintext campaign data
+.cache/
+node_modules/
+screenshots/
+example/
+*.plain.json
+.env
+assets-src/
