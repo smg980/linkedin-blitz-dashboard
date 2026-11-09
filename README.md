@@ -23,3 +23,17 @@ BLITZ_DIR=/path/to/source node scripts/build.mjs   # writes docs/data.enc.json
 ## Brand / theme
 `docs/theme.css` is the Meeting Prep stylesheet, unchanged. All colors are CSS variables in its single `:root` block.
 `docs/blitz.css` adds campaign components and uses only those tokens. Fonts (Manrope headings, DM Sans body) and the official MASTER Intelligence logo are self-hosted.
+
+## Testing and release safety
+Run `npm test` with Node.js 20+ before proposing a change. GitHub Actions runs synthetic-only tests on pull requests and on merges to `main`. Tests include browser queue behavior, explicit draft copying, encryption round-trip, randomized salt/IV, PII scrubbing, and fail-closed build validation.
+
+To build without touching the live `docs/data.enc.json`, provide a separate output path:
+```bash
+BLITZ_DIR=/path/to/private/source BLITZ_OUTPUT_DIR=/tmp/blitz-qa \
+  DASHBOARD_PASSPHRASE='your-existing-strong-passphrase' node scripts/build.mjs
+```
+Use `--dry-run` for counts only (no encryption or output). `--example --dry-run` works without access to private campaign sources. `--plain-check` is limited to synthetic example builds and must never be used on real campaign data.
+
+The live GitHub Pages application is served from `main/docs`. Make changes in a feature branch, wait for passing PR checks, review the diff, then merge. The encrypted production dataset should not be regenerated merely to publish code improvements.
+
+**Security boundaries:** The ciphertext is publicly downloadable on GitHub Pages even though its contents are encrypted. Keep a strong, unique passphrase outside GitHub and do not expose it through CI or logs. The "Keep unlocked in this tab" setting stores that passphrase in tab-scoped session storage until locked or the tab closes. The app never sends LinkedIn messages or claims a touch was sent without confirmation.
