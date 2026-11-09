@@ -118,3 +118,14 @@ test('published HTML keeps strict same-origin CSP and manual outreach', () => {
   assert.match(js, /Steve sends manually/);
   assert.doesNotMatch(js, /linkedin\.com\/voyager\/api/);
 });
+
+test('two contacts sharing a first name keep different encrypted identities', async t => {
+  const other = 'ACME-JANE-20261110-CONNECT,Acme,Jane Different,VP IT,Synthetic signal,Second draft,Draft Ready,2026-11-10';
+  const f = fixture(t, { csv: header + '\n' + row + '\n' + other + '\n' });
+  execFileSync(process.execPath, [builder], { env: f.env, encoding: 'utf8' });
+  const blob = JSON.parse(readFileSync(path.join(f.out, 'data.enc.json'), 'utf8'));
+  const data = await decrypt(blob, secret);
+  assert.equal(data.contacts.length, 2);
+  assert.notEqual(data.contacts[0].personKey, data.contacts[1].personKey);
+  assert.equal(data.contacts[1].contact, 'Jane Different');
+});
