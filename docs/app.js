@@ -25,9 +25,14 @@
   const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
   async function fetchBlob() { const r = await fetch('data.enc.json', { cache: 'no-store' }); if (!r.ok) throw new Error('Could not load encrypted data.'); return r.json(); }
   async function decrypt(blob, pass) {
+    if (!blob || blob.v !== 1 || blob.alg !== 'AES-256-GCM' || blob.kdf !== 'PBKDF2-SHA256' || blob.iterations !== 600000
+      || typeof blob.salt !== 'string' || typeof blob.iv !== 'string' || typeof blob.ct !== 'string')
+      throw new Error('Unsupported or invalid encrypted data format.');
+    const salt = unb64(blob.salt), iv = unb64(blob.iv);
+    if (salt.length !== 16 || iv.length !== 12) throw new Error('Invalid encrypted data parameters.');
     const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
-    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt: unb64(blob.salt), iterations: blob.iterations, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
-    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(blob.iv) }, key, unb64(blob.ct));
+    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: blob.iterations, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, unb64(blob.ct));
     return JSON.parse(new TextDecoder().decode(pt));
   }
 
@@ -46,7 +51,7 @@
   const CLS = { 'Research Needed': 'todo', 'Draft Ready': 'draft', 'Approved': 'approved', 'Sent Confirmed': 'ready', 'Replied': 'ready', 'Next Action': 'next', 'On Hold': 'hold' };
   const READY = s => ['Draft Ready', 'Approved', 'Next Action'].includes(s);
   const ACTIVE = s => !['On Hold', 'Sent Confirmed', 'Replied'].includes(s);
-  const overdue = c => c.dueIso && ACTIVE(c.status) && c.status !== 'Research Needed' && c.dueIso < todayIso();
+  const overdue = c => c.dueIso && ACTIVE(c.status) && c.dueIso < todayIso();
   const badge = (s, extra = '') => `<span class="status ${CLS[s] || 'todo'}">${esc(s)}${extra}</span>`;
   const badgeFor = c => overdue(c) ? `<span class="status urgent">Overdue · ${esc(c.status)}</span>` : badge(c.status);
   const RANK = ['Draft Ready', 'Approved', 'Next Action', 'Research Needed', 'Replied', 'Sent Confirmed', 'On Hold'];
@@ -107,7 +112,10 @@
     for (const c of DATA.contacts) { if (!m.has(c.personKey)) m.set(c.personKey, { key: c.personKey, rid: c.id, account: c.account, name: c.contact, role: c.role, rows: [] }); m.get(c.personKey).rows.push(c); }
     for (const p of m.values()) {
       p.status = p.rows.map(r => r.status).sort((a, b) => RANK.indexOf(a) - RANK.indexOf(b))[0];
-      p.next = p.rows.find(r => r.actionCode === 'CONNECT') || p.rows[0];
+      const pending = p.rows.filter(r => ACTIVE(r.status));
+      p.next = pending.sort((a, b) =>
+        (a.dueIso || '9999-12-31').localeCompare(b.dueIso || '9999-12-31') ||
+        RANK.indexOf(a.status) - RANK.indexOf(b.status))[0] || p.rows.at(-1);
       p.overdue = p.rows.some(overdue);
     }
     return [...m.values()];
@@ -201,7 +209,7 @@
     const f = p.rows[0];
     const kv = rows => `<dl class="kv-grid">${rows.filter(([, v]) => v).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${md(v)}</dd>`).join('')}</dl>`;
     const drafts = p.rows.map(r => { const text = r.connectionNote || r.followup;
-      return `<div class="draft"><div class="draft-head"><h3>${esc(r.action)}</h3>${badgeFor(r)}<span class="chars">${esc(r.draft)}${r.actionCode === 'CONNECT' && text ? ` · ${text.replace(/^PROVISIONAL — /, '').length} chars` : ''}</span></div>
+      return `<div class="draft"><div class="draft-head"><h3>${esc(r.action)}</h3>${badgeFor(r)}<span class="chars">${esc(r.draft)}${r.actionCode === 'CONNECT' && text ? ` · ${text.replace(/^PROVISIONAL — /, '').length} chars` : ''}</span>${text ? `<button class="btn ghost sm" type="button" data-copy-draft="${esc(r.id)}">Copy draft</button>` : ''}</div>
         ${text ? `<blockquote>${md(text)}</blockquote>` : '<p class="muted">No draft text.</p>'}
         ${kv([['Key', r.key], ['Due', r.due], ['Next action', r.nextAction], ['Status (raw)', r.statusRaw]])}</div>`; }).join('');
     return `<nav class="crumbs no-print"><a href="#/accounts">${ICON.back}Contact queue</a></nav>
@@ -240,7 +248,21 @@
   }
   let LAST = '';
   window.addEventListener('hashchange', () => { route(); if (location.hash !== LAST) window.scrollTo(0, 0); LAST = location.hash; });
-  document.addEventListener('click', e => {
+  document.addEventListener('click', async e => {
+    const copy = e.target.closest('[data-copy-draft]');
+    if (copy && DATA) {
+      const row = DATA.contacts.find(r => r.id === copy.dataset.copyDraft);
+      const draft = row && (row.connectionNote || row.followup);
+      if (draft) {
+        try {
+          if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
+          await navigator.clipboard.writeText(draft);
+          copy.textContent = 'Copied';
+        } catch {
+          copy.textContent = 'Copy unavailable';
+        }
+      }
+    }
     if (e.target.closest('[data-action="print"]')) window.print();
     const f = e.target.closest('[data-filter]'); if (f) { FILTER = f.dataset.filter; route(); }
   });
@@ -250,6 +272,7 @@
   async function unlock(pass, remember) {
     DATA = await decrypt(await fetchBlob(), pass);
     if (remember) sessionStorage.setItem(SS, pass);
+    else sessionStorage.removeItem(SS);
     $('#lock').hidden = true; $('#app').hidden = false; $('#pass').value = '';
     route();
   }
