@@ -45,7 +45,8 @@ test('browser queue shows the next pending touch and copies only after a direct 
   const blob = await encryptedData(payload, passphrase);
   const nodes = new Map(), handlers = {};
   const node = selector => {
-    if (!nodes.has(selector)) nodes.set(selector, { innerHTML: '', textContent: '', hidden: false, value: '', checked: false, disabled: false, className: '', focus() {} });
+    if (!nodes.has(selector)) nodes.set(selector, { innerHTML: '', textContent: '', hidden: false, value: '', checked: false, disabled: false, className: '', focus() {},
+      addEventListener(event, fn) { handlers[selector + ':' + event] = fn; } });
     return nodes.get(selector);
   };
   node('#pass').value = passphrase;
@@ -68,6 +69,24 @@ test('browser queue shows the next pending touch and copies only after a direct 
     fetch: async () => { fetchCount++; return { ok: true, json: async () => blob }; }
   };
   runInNewContext(readFileSync(path.join(root, 'docs', 'app.js'), 'utf8'), context);
-  assert.equal(typeof handlers.submit, 'undefined');
-  // The submit event is registered on the unlock form rather than the document.
+  const submit = handlers['#unlock-form:submit'];
+  assert.equal(typeof submit, 'function');
+  await submit({ preventDefault() {} });
+  assert.equal(node('#lock').hidden, true);
+  assert.equal(node('#app').hidden, false);
+  assert.equal(fetchCount, 1);
+  assert.match(node('#view').innerHTML, /2026-11-10/);
+  assert.doesNotMatch(node('#view').innerHTML, /2026-11-08/);
+
+  location.hash = '#/contact/old';
+  handlers.hashchange();
+  assert.match(node('#view').innerHTML, /data-copy-draft="next"/);
+  assert.doesNotMatch(node('#view').innerHTML, /<img src=x onerror/);
+  const btn = { dataset: { copyDraft: 'next' }, textContent: 'Copy draft' };
+  assert.equal(copied, null);
+  await handlers.click({ target: {
+    closest(selector) { return selector === '[data-copy-draft]' ? btn : null; }
+  } });
+  assert.equal(copied, 'Hello <img src=x onerror=alert(1)>');
+  assert.equal(btn.textContent, 'Copied');
 });
