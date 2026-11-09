@@ -18,7 +18,9 @@ const args = new Set(process.argv.slice(2));
 const DRY = args.has('--dry-run'), EXAMPLE = args.has('--example');
 
 // Campaign config (accounts, calendar, rules) lives with the private source files, not in this repo.
-const CAMPAIGN = { name: 'LinkedIn Blitz', plan: {}, rules: [], accounts: [], ...JSON.parse(await fs.readFile(path.join(SRC, 'campaign.json'), 'utf8').catch(() => '{}')) };
+const CAMPAIGN = EXAMPLE
+  ? { name: 'EXAMPLE LinkedIn Blitz', start: '2026-10-20', end: '2026-10-23', plan: {}, rules: ['EXAMPLE DATA ONLY — do not send'], accounts: ['EXAMPLE Acme', 'EXAMPLE Globex'] }
+  : { name: 'LinkedIn Blitz', plan: {}, rules: [], accounts: [], ...JSON.parse(await fs.readFile(path.join(SRC, 'campaign.json'), 'utf8').catch(() => '{}')) };
 const STATUSES = ['Research Needed', 'Draft Ready', 'Approved', 'Sent Confirmed', 'Replied', 'Next Action', 'On Hold'];
 
 // ---------- PII scrub ----------
@@ -34,7 +36,7 @@ const deepScrub = v => Array.isArray(v) ? v.map(deepScrub) : v && typeof v === '
 
 // ---------- helpers ----------
 const rid = (ns, s) => createHash('sha256').update(`lbd-${ns}-v1:${s}`).digest('base64url').slice(0, 12);
-function parseCSV(text) {
+export function parseCSV(text) {
   const rows = []; let row = [], f = '', q = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
@@ -45,6 +47,7 @@ function parseCSV(text) {
   }
   if (f || row.length) { row.push(f); rows.push(row); }
   const [h, ...body] = rows.filter(r => r.some(x => x.trim()));
+  if (!h) throw new Error('activity_log.csv is missing its header');
   return body.map(r => Object.fromEntries(h.map((k, i) => [k.replace(/^\ufeff/, ''), (r[i] ?? '').trim()])));
 }
 export function normStatus(s) {
@@ -93,6 +96,13 @@ const textOf = bs => bs.map(b => [b.text, ...(b.children ? [textOf(b.children)] 
 async function readSources() {
   const files = await fs.readdir(SRC);
   const log = parseCSV(await fs.readFile(path.join(SRC, 'activity_log.csv'), 'utf8'));
+  if (!log.length) throw new Error('activity_log.csv is empty; refusing to replace the live campaign with empty data');
+  const seen = new Set();
+  for (const row of log) {
+    if (!row.key || !row.account || !row.contact) throw new Error('Each activity row must contain key, account and contact');
+    if (seen.has(row.key)) throw new Error('Duplicate activity key found; refusing to publish ambiguous contact data');
+    seen.add(row.key);
+  }
   const contacts = log.map(r => {
     const [acctCode, first, date, act] = r.key.split('-');
     return {
@@ -161,7 +171,21 @@ function exampleData() {
   return { contacts, briefs, plans: [], needs: [{ from: 'EXAMPLE', docId: briefs[0].id, text: 'EXAMPLE need', children: [] }] };
 }
 
+function validateCampaign() {
+  const validDate = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v + 'T12:00:00Z'))
+    && new Date(v + 'T12:00:00Z').toISOString().startsWith(v);
+  if (!validDate(CAMPAIGN.start) || !validDate(CAMPAIGN.end) || CAMPAIGN.start > CAMPAIGN.end)
+    throw new Error('campaign.json needs valid start/end dates in YYYY-MM-DD format');
+  const span = (Date.parse(CAMPAIGN.end + 'T12:00:00Z') - Date.parse(CAMPAIGN.start + 'T12:00:00Z')) / 86400000;
+  if (span > 366) throw new Error('Campaign calendar exceeds 366 days; check start/end dates');
+  if (!Array.isArray(CAMPAIGN.accounts) || !Array.isArray(CAMPAIGN.rules) || !CAMPAIGN.plan || Array.isArray(CAMPAIGN.plan) || typeof CAMPAIGN.plan !== 'object')
+    throw new Error('campaign.json needs accounts/rules arrays and a plan object');
+}
+
 async function main() {
+  if (args.has('--plain-check') && !EXAMPLE)
+    throw new Error('--plain-check is restricted to synthetic --example data');
+  validateCampaign();
   const pass = process.env.DASHBOARD_PASSPHRASE;
   if (!pass && !DRY) { console.error('DASHBOARD_PASSPHRASE is not set.'); process.exit(1); }
   if (pass && pass.length < 12) console.warn('Warning: passphrase shorter than 12 characters.');
@@ -171,10 +195,10 @@ async function main() {
   payload = deepScrub(payload);
   console.log(`rows: ${src.contacts.length} · contacts: ${new Set(src.contacts.map(c => c.personKey)).size} · briefs: ${src.briefs.length} · plans: ${src.plans.length} · needs: ${src.needs.length} · stripped emails: ${stripped.email}, phones: ${stripped.phone}`);
   if (DRY) return;
-  const outDir = EXAMPLE ? path.join(ROOT, 'example') : path.join(ROOT, 'docs');
+  const outDir = process.env.BLITZ_OUTPUT_DIR ? path.resolve(process.env.BLITZ_OUTPUT_DIR) : EXAMPLE ? path.join(ROOT, 'example') : path.join(ROOT, 'docs');
   await fs.mkdir(outDir, { recursive: true });
   await fs.writeFile(path.join(outDir, 'data.enc.json'), JSON.stringify(await encrypt(payload, pass)) + '\n');
-  if (args.has('--plain-check')) await fs.writeFile(path.join(ROOT, 'example', 'last.plain.json'), JSON.stringify(payload, null, 1)); // gitignored, local QA only
+  if (args.has('--plain-check')) await fs.writeFile(path.join(outDir, 'last.plain.json'), JSON.stringify(payload, null, 1)); // synthetic example QA only
   console.log(`wrote ${path.relative(ROOT, path.join(outDir, 'data.enc.json'))}`);
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch(e => { console.error(e.message); process.exit(1); });
