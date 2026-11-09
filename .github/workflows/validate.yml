@@ -25,5 +25,10 @@ jobs:
           node --check docs/app.js
           node --check scripts/build.mjs
           node --check tests/blitz.test.mjs
+          node --check tests/browser.test.mjs
+          node --check tests/bundle.test.mjs
+          node --check scripts/check-published.mjs
       - name: Run synthetic-only tests
         run: npm test
+      - name: Verify committed encrypted GitHub Pages bundle
+        run: npm run verify:bundle
