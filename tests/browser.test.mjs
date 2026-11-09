@@ -20,11 +20,19 @@ const next = {
   followup: 'Hello <img src=x onerror=alert(1)>', nextAction: 'Send after approval',
   key: 'ACME-JANE-20261110-AFTERACCEPT'
 };
+const colleague = {
+  ...next, id: 'colleague', key: 'ACME-JANE-20261111-CONNECT',
+  contact: 'Jane Different', personKey: 'ACME-JANE',
+  status: 'Research Needed', statusRaw: 'Research Needed',
+  due: '2026-11-11', dueIso: '2026-11-11',
+  action: 'Connection note', actionCode: 'CONNECT',
+  connectionNote: '', followup: '', nextAction: 'Verify identity first'
+};
 const payload = {
-  generatedAt: '2026-11-09T16:00:00Z', example: true,
+  generatedAt: '2020-11-09T16:00:00Z', example: true,
   campaign: { name: 'Synthetic', start: '2026-11-08', end: '2026-11-11', accounts: ['Acme'], rules: [], plan: {} },
-  contacts: [old, next], briefs: [], plans: [], needs: [], schedule: [],
-  statuses, recap: Object.fromEntries(statuses.map(s => [s, [old, next].filter(r => r.status === s).length]))
+  contacts: [old, next, colleague], briefs: [], plans: [], needs: [], schedule: [],
+  statuses, recap: Object.fromEntries(statuses.map(s => [s, [old, next, colleague].filter(r => r.status === s).length]))
 };
 
 async function encryptedData(data, passphrase) {
@@ -65,7 +73,7 @@ test('browser queue shows the next pending touch and copies only after a direct 
   const navigator = { clipboard: { async writeText(value) { copied = value; } } };
   const context = {
     document, window, location, sessionStorage, navigator,
-    crypto: webcrypto, TextEncoder, TextDecoder, atob,
+    crypto: webcrypto, TextEncoder, TextDecoder, atob, URLSearchParams,
     fetch: async () => { fetchCount++; return { ok: true, json: async () => blob }; }
   };
   runInNewContext(readFileSync(path.join(root, 'docs', 'app.js'), 'utf8'), context);
@@ -77,10 +85,33 @@ test('browser queue shows the next pending touch and copies only after a direct 
   assert.equal(fetchCount, 1);
   assert.match(node('#view').innerHTML, /2026-11-10/);
   assert.doesNotMatch(node('#view').innerHTML, /2026-11-08/);
+  assert.match(node('#view').innerHTML, /Jane Different/);
+  assert.match(node('#view').innerHTML, /2 contacts/);
+  assert.match(node('#view').innerHTML, /Snapshot may be outdated/);
+  assert.match(node('#view').innerHTML, /data-filter="overdue"/);
+
+  // Hash-linked filters work without exposing one colleague's drafts in another's record.
+  location.hash = '#/accounts?filter=actionable';
+  handlers.hashchange();
+  assert.match(node('#view').innerHTML, /Jane Example/);
+  assert.doesNotMatch(node('#view').innerHTML, /Jane Different/);
+  assert.match(node('#view').innerHTML, /aria-pressed="true" data-filter="actionable"/);
+  location.hash = '#/accounts?filter=Research%20Needed';
+  handlers.hashchange();
+  assert.match(node('#view').innerHTML, /Jane Different/);
+  assert.doesNotMatch(node('#view').innerHTML, /Jane Example/);
+  location.hash = '#/accounts?filter=invalid';
+  handlers.hashchange();
+  assert.match(node('#view').innerHTML, /Jane Example/);
+  assert.match(node('#view').innerHTML, /Jane Different/);
+  const filterButton = { dataset: { filter: 'actionable' } };
+  await handlers.click({ target: { closest(selector) { return selector === '[data-filter]' ? filterButton : null; } } });
+  assert.equal(location.hash, '#/accounts?filter=actionable');
 
   location.hash = '#/contact/old';
   handlers.hashchange();
   assert.match(node('#view').innerHTML, /data-copy-draft="next"/);
+  assert.doesNotMatch(node('#view').innerHTML, /Jane Different/);
   assert.doesNotMatch(node('#view').innerHTML, /<img src=x onerror/);
   const btn = { dataset: { copyDraft: 'next' }, textContent: 'Copy draft' };
   assert.equal(copied, null);
