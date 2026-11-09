@@ -47,3 +47,12 @@ a.doc-card:hover{border-color:var(--interactive)}
 .filters{margin-bottom:6px}
 @media (max-width:860px){.navbar{position:static}.nav-seg{padding:6px 16px}.sched .day{grid-template-columns:1fr}.c-card,.doc-card{grid-template-columns:1fr}.needs li{grid-template-columns:1fr}}
 @media print{.navbar{display:none!important}}
+
+/* Small-screen queue controls remain keyboard-accessible without wrapping into unreadable rows. */
+.filters{overflow-x:auto;max-width:100%;scrollbar-width:thin}
+.filters .seg-btn{flex:0 0 auto;white-space:nowrap}
+.queue-context{font-size:12px;margin:0 0 12px;line-height:1.4}
+.queue-shortcuts{margin-top:8px!important}
+.snapshot-warning{border:1px solid var(--line-strong);border-left:3px solid var(--warning);border-radius:10px;padding:10px 14px;font-size:13px;line-height:1.5}
+.snapshot-warning strong{color:var(--warning)}
+@media print{.filters,.queue-context,.queue-shortcuts,.snapshot-warning{display:none!important}}

@@ -112,7 +112,7 @@ async function readSources() {
       connectionNote: r.connection_note, followup: r.followup_message, recommended: r.recommended_action, dupCheck: r.dup_optout_check,
       draft: r.draft_version, lastInteraction: r.last_confirmed_interaction, nextAction: r.next_action, due: r.due_date, dueIso: isoDue(r.due_date),
       source: r.source, statusRaw: r.confirmation_status, status: normStatus(r.confirmation_status),
-      action: ACTION[act] || act || '', actionCode: act || '', person: first ? first[0] + first.slice(1).toLowerCase() : '', personKey: `${acctCode}-${first}`,
+      action: ACTION[act] || act || '', actionCode: act || '', person: first ? first[0] + first.slice(1).toLowerCase() : '', personKey: rid('person', `${r.account.trim().toLocaleLowerCase()}::${r.contact.trim().toLocaleLowerCase()}`),
     };
   });
   const briefs = [];

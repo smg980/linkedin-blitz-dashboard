@@ -54,7 +54,7 @@
   const overdue = c => c.dueIso && ACTIVE(c.status) && c.dueIso < todayIso();
   const badge = (s, extra = '') => `<span class="status ${CLS[s] || 'todo'}">${esc(s)}${extra}</span>`;
   const badgeFor = c => overdue(c) ? `<span class="status urgent">Overdue · ${esc(c.status)}</span>` : badge(c.status);
-  const RANK = ['Draft Ready', 'Approved', 'Next Action', 'Research Needed', 'Replied', 'Sent Confirmed', 'On Hold'];
+  const RANK = ['Approved', 'Draft Ready', 'Next Action', 'Research Needed', 'Replied', 'Sent Confirmed', 'On Hold'];
 
   // ---------- safe inline markdown ----------
   function md(src) {
@@ -109,14 +109,22 @@
   let DATA = null;
   const people = () => {
     const m = new Map();
-    for (const c of DATA.contacts) { if (!m.has(c.personKey)) m.set(c.personKey, { key: c.personKey, rid: c.id, account: c.account, name: c.contact, role: c.role, rows: [] }); m.get(c.personKey).rows.push(c); }
+    // Legacy ciphertext used account + first name as personKey. Group by the full
+    // account/contact identity so two colleagues named Jane cannot share drafts.
+    for (const c of DATA.contacts) {
+      const key = JSON.stringify([c.account, String(c.contact || '').trim().toLocaleLowerCase()]);
+      if (!m.has(key)) m.set(key, { key, rid: c.id, account: c.account, name: c.contact, role: c.role, rows: [] });
+      m.get(key).rows.push(c);
+    }
     for (const p of m.values()) {
-      p.status = p.rows.map(r => r.status).sort((a, b) => RANK.indexOf(a) - RANK.indexOf(b))[0];
       const pending = p.rows.filter(r => ACTIVE(r.status));
       p.next = pending.sort((a, b) =>
         (a.dueIso || '9999-12-31').localeCompare(b.dueIso || '9999-12-31') ||
         RANK.indexOf(a.status) - RANK.indexOf(b.status))[0] || p.rows.at(-1);
+      p.status = p.next.status; // the visible badge describes the next active touch
       p.overdue = p.rows.some(overdue);
+      p.dueToday = p.rows.some(r => r.dueIso === todayIso() && ACTIVE(r.status));
+      p.actionable = p.rows.some(r => READY(r.status));
     }
     return [...m.values()];
   };
@@ -140,9 +148,14 @@
         <h2>${esc(C.name)}</h2>
         <div class="meta"><span>${ICON.cal}${esc(dfmt(C.start, { month: 'short', day: 'numeric' }))}–${esc(dfmt(C.end, { month: 'short', day: 'numeric', year: 'numeric' }))}</span>
           <span>${ICON.users}${ps.length} contacts · ${DATA.contacts.length} planned touches</span>
-          <span>${ICON.clock}Today: ${today.length} due · ${todayActive.length} ready to send</span></div>
+          <span>${ICON.clock}Today: ${today.length} scheduled · ${todayActive.length} open drafts/actions</span></div>
         <div class="acct-chips">${C.accounts.map(a => `<span class="chip"><i>${esc(a.split(/\s+/).map(w => w[0]).join('').slice(0, 2).toUpperCase())}</i>${esc(a)}</span>`).join('')}</div>
-        <div class="actions">${(briefToday[0] || latest) ? `<a class="btn primary" href="#/doc/${esc((briefToday[0] || latest).id)}">${briefToday[0] ? "Open today's brief" : 'Open latest brief'}${ICON.arrow}</a>` : ''}<a class="btn ghost" href="#/accounts">Contact queue</a><span class="pill-stat">Prep only · Steve sends</span></div>
+        <div class="actions">${(briefToday[0] || latest) ? `<a class="btn primary" href="#/doc/${esc((briefToday[0] || latest).id)}">${briefToday[0] ? "Open today's brief" : 'Open latest brief'}${ICON.arrow}</a>` : ''}<a class="btn ghost" href="#/accounts">Contact queue</a><span class="pill-stat">Prep only · seller confirms every send</span></div>
+        <div class="actions queue-shortcuts" aria-label="Queue shortcuts">
+          <a class="btn ghost sm" href="#/accounts?filter=overdue">Overdue · ${ps.filter(p => p.overdue).length}</a>
+          <a class="btn ghost sm" href="#/accounts?filter=today">Due today · ${ps.filter(p => p.dueToday).length}</a>
+          <a class="btn ghost sm" href="#/accounts?filter=actionable">Actionable · ${ps.filter(p => p.actionable).length}</a>
+        </div>
       </div>
       <div class="countdown day-ring"><div class="cd"><b>${String(Math.max(0, Math.min(total, dayN))).padStart(2, '0')}</b><small>day</small></div><div class="cd"><b>${String(Math.max(0, total - Math.max(0, dayN))).padStart(2, '0')}</b><small>left</small></div></div>
     </section>`;
@@ -191,13 +204,21 @@
   let FILTER = 'all';
   function viewAccounts(only) {
     const accs = accounts().filter(a => !only || slug(a.name) === only);
-    const filt = p => FILTER === 'all' || p.status === FILTER;
-    const segs = ['all', ...DATA.statuses].map(s => `<button class="seg-btn ${FILTER === s ? 'active' : ''}" data-filter="${esc(s)}">${s === 'all' ? 'All' : esc(s)}</button>`).join('');
-    return `${only ? `<nav class="crumbs"><a href="#/accounts">${ICON.back}All accounts</a></nav>` : ''}<div class="seg filters" role="tablist">${segs}</div>
+    const visible = accs.flatMap(a => a.people);
+    const filt = p => FILTER === 'all' || (FILTER === 'overdue' && p.overdue)
+      || (FILTER === 'today' && p.dueToday) || (FILTER === 'actionable' && p.actionable)
+      || p.status === FILTER;
+    const choices = [['all', 'All'], ['overdue', 'Overdue'], ['today', 'Due today'], ['actionable', 'Actionable'], ...DATA.statuses.map(s => [s, s])];
+    const segs = choices.map(([id, label]) => `<button type="button" class="seg-btn ${FILTER === id ? 'active' : ''}" aria-pressed="${FILTER === id}" data-filter="${esc(id)}">${esc(label)} · ${visible.filter(p => id === 'all' || (id === 'overdue' && p.overdue) || (id === 'today' && p.dueToday) || (id === 'actionable' && p.actionable) || p.status === id).length}</button>`).join('');
+    return `${only ? `<nav class="crumbs"><a href="#/accounts">${ICON.back}All accounts</a></nav>` : ''}<div class="seg filters" role="toolbar" aria-label="Filter contact queue">${segs}</div>
+      <p class="queue-context muted">Showing ${visible.filter(filt).length} of ${visible.length} contacts · Snapshot only; verify status before sending.</p>
       ${accs.map(a => { const ps = a.people.filter(filt); const cnt = statCounts(a.people.map(p => ({ status: p.status })));
         return `<section class="panel acct-panel"><div class="panel-head"><div class="acct-head"><h2>${esc(a.name)}</h2><span class="muted">${a.people.length} contact${a.people.length === 1 ? '' : 's'}</span></div>
           <div class="counts">${DATA.statuses.filter(s => cnt[s]).map(s => `<span class="status ${CLS[s]}">${esc(s)} · ${cnt[s]}</span>`).join('')}</div></div>
-          <div class="cards">${ps.length ? ps.sort((x, y) => RANK.indexOf(x.status) - RANK.indexOf(y.status)).map(p => `<a class="card c-card" href="#/contact/${esc(p.rid)}">
+          <div class="cards">${ps.length ? ps.sort((x, y) => Number(y.overdue) - Number(x.overdue)
+            || (x.next.dueIso || '9999-12-31').localeCompare(y.next.dueIso || '9999-12-31')
+            || RANK.indexOf(x.status) - RANK.indexOf(y.status)
+            || x.name.localeCompare(y.name)).map(p => `<a class="card c-card" href="#/contact/${esc(p.rid)}">
             <div><div class="title-row"><h3>${esc(p.name)}</h3></div><p class="role">${md(p.role)}</p>
               <div class="c-meta"><span>${ICON.clock}${esc(p.next.due || '—')}</span><span>${ICON.notes}${p.rows.length} touch${p.rows.length === 1 ? '' : 'es'} · ${esc(p.next.draft || '')}</span><span>${ICON.flag}${esc(p.next.nextAction || '')}</span></div></div>
             <div class="side">${p.overdue ? '<span class="status urgent">Overdue</span>' : ''}${badge(p.status)}<span class="btn primary sm">Open${ICON.arrow}</span></div></a>`).join('')
@@ -235,14 +256,23 @@
     if ((m = h.match(/^#\/doc\/([A-Za-z0-9_-]+)/))) { html = viewDoc(m[1]); nav = 'briefs'; }
     else if (h.startsWith('#/briefs')) { html = viewBriefs(); nav = 'briefs'; }
     else if ((m = h.match(/^#\/contact\/([A-Za-z0-9_-]+)/))) { html = viewContact(m[1]); nav = 'accounts'; }
-    else if ((m = h.match(/^#\/accounts(?:\/([a-z0-9-]+))?/))) { html = viewAccounts(m[1]); nav = 'accounts'; }
+    else if ((m = h.match(/^#\/accounts(?:\/([a-z0-9-]+))?/))) {
+      const requested = new URLSearchParams(h.split('?')[1] || '').get('filter') || 'all';
+      FILTER = ['all', 'overdue', 'today', 'actionable', ...DATA.statuses].includes(requested) ? requested : 'all';
+      html = viewAccounts(m[1]); nav = 'accounts';
+    }
     else if (h.startsWith('#/needs')) { html = viewNeeds(); nav = 'needs'; }
     else html = viewOverview();
-    const v = $('#view'); v.className = 'content' + (/doc|contact/.test(h) ? ' detail' : ''); v.innerHTML = html;
+    const updatedAt = Date.parse(DATA.generatedAt);
+    const stale = !Number.isFinite(updatedAt) || Date.now() - updatedAt > 48 * 60 * 60 * 1000;
+    const notice = stale ? '<div class="snapshot-warning" role="status"><strong>Snapshot may be outdated.</strong> Campaign data is over 48 hours old or missing a valid refresh date. Verify every status and due date before outreach.</div>' : '';
+    const v = $('#view'); v.className = 'content' + (/doc|contact/.test(h) ? ' detail' : ''); v.innerHTML = notice + html;
     document.querySelectorAll('#nav [data-nav]').forEach(a => a.classList.toggle('active', a.dataset.nav === nav));
     $('#needs-count').textContent = DATA.needs.length || '';
-    const gen = new Date(DATA.generatedAt);
-    $('#subtitle').textContent = `Updated ${fmt(gen, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} ${tzAbbr(gen)}`;
+    const gen = Number.isFinite(updatedAt) ? new Date(updatedAt) : null;
+    $('#subtitle').textContent = gen
+      ? `Snapshot ${fmt(gen, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} ${tzAbbr(gen)}`
+      : 'Snapshot date unavailable';
     $('#foot').textContent = `Prep only · Steve sends every touch · All dates Central (${tzAbbr(new Date())}) · Encrypted client-side, AES-256-GCM`;
     $('#example-banner').hidden = !DATA.example;
   }
@@ -264,7 +294,14 @@
       }
     }
     if (e.target.closest('[data-action="print"]')) window.print();
-    const f = e.target.closest('[data-filter]'); if (f) { FILTER = f.dataset.filter; route(); }
+    const f = e.target.closest('[data-filter]');
+    if (f) {
+      const base = (location.hash || '#/accounts').split('?')[0];
+      const target = (base.startsWith('#/accounts') ? base : '#/accounts')
+        + (f.dataset.filter === 'all' ? '' : '?filter=' + encodeURIComponent(f.dataset.filter));
+      if (location.hash === target) route();
+      else location.hash = target; // hashchange keeps filters shareable and back-button friendly
+    }
   });
 
   // ---------- lock / unlock ----------
