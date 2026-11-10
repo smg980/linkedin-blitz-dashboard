@@ -104,7 +104,11 @@ async function readSources() {
     seen.add(row.key);
   }
   const contacts = log.map(r => {
-    const [acctCode, first, date, act] = r.key.split('-');
+    const parts = r.key.split('-');
+    // Activity keys can include an extra namespace segment, e.g. PFD-FLEET-...-CONNECT.
+    // Read the action and YYYYMMDD date from the right, never by fixed array indexes.
+    const acctCode = parts[0], first = parts.slice(1, -2).join('-');
+    const date = parts.at(-2), act = parts.at(-1);
     return {
       id: rid('row', r.key), key: r.key, account: r.account, contact: r.contact, role: r.role, roleSource: r.role_source,
       roleVerified: r.role_verified_date, relationship: r.relationship_status, linkedin: r.linkedin_ref, warmIntro: r.warm_intro_candidate,
