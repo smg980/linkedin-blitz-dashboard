@@ -132,7 +132,7 @@ test('two contacts sharing a first name keep different encrypted identities', as
 
 test('namespaced fleet activity keys retain the correct action code', async t => {
   const row = 'PFD-FLEET-SCOTTNICKELL-20261118-CONNECT,Prairie Farms Dairy,Scott Nickell,Manager,Synthetic,Proposed only,Research Needed,2026-11-18';
-  const f = fixture(t, { csv: header + '\\n' + row + '\\n' });
+  const f = fixture(t, { csv: header + '\n' + row + '\n' });
   execFileSync(process.execPath, [builder], { env: f.env, encoding: 'utf8' });
   const blob = JSON.parse(readFileSync(path.join(f.out, 'data.enc.json'), 'utf8'));
   const data = await decrypt(blob, secret);
