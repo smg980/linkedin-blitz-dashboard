@@ -6,3 +6,8 @@ example/
 *.plain.json
 .env
 assets-src/
+
+# Firebase synthetic output must never be committed
+.firebase-blitz-demo/
+.firebase-blitz-demo-tmp/
+.firebase/
