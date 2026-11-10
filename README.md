@@ -47,3 +47,11 @@ The UI warns when its decrypted dataset was built over 48 hours ago or lacks a v
 `npm run verify:bundle` checks the committed GitHub Pages ciphertext's exact AES-GCM/PBKDF2 metadata, canonical base64 encoding, salt/IV/tag lengths, and references to locally hosted JavaScript/CSS. It does **not** decrypt or inspect private contacts. CI runs this check on each PR alongside the synthetic-data tests. Successful verification proves structural validity, not that the campaign content is current or that the passphrase is correct.
 
 GitHub's branch-hosted Pages deployment is a separate process; these checks run on the pull request before *our* merge, but this workflow does not by itself enforce repository branch protection. A repository administrator should separately require the `test` check on merges if protection is not already configured.
+
+## Firebase migration staging — next to Meeting Prep
+
+A separate **synthetic-only** Firebase Hosting candidate is prepared for the existing Firebase project `master-intelligence-5496f`. Target `blitz` maps to the **proposed**, not yet created, site `master-intelligence-5496f-lb`; planned custom domain is `blitz.masterintelligence.ai`. This does not deploy or change the Meeting Prep `prep` site, MASTER application, existing GitHub Pages URL, production campaign ciphertext or passphrase.
+
+Run `npm test` to validate the staging safeguards, or `npm run build:firebase-demo && npm run verify:firebase-demo` to generate and verify the four-contact fictional preview under the Gitignored `.firebase-blitz-demo/` directory. It refuses an inherited production passphrase and never copies `docs/data.enc.json`. Do not publish real outreach data directly to Firebase Hosting: static Hosting files are publicly retrievable.
+
+**Production migration remains gated** on the Meeting Prep Firebase Auth/Firestore authorization review, merged security rules tests, secure access to encrypted data, approved passphrase rotation and separate `hosting:blitz` deployment. See [Firebase Blitz migration plan](docs/FIREBASE_BLITZ_MIGRATION.md). The live GitHub Pages campaign remains the rollback.
