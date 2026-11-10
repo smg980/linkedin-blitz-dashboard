@@ -28,7 +28,12 @@ jobs:
           node --check tests/browser.test.mjs
           node --check tests/bundle.test.mjs
           node --check scripts/check-published.mjs
+          node --check scripts/build-firebase-demo.mjs
+          node --check scripts/verify-firebase-demo.mjs
+          node --check tests/firebase.test.mjs
       - name: Run synthetic-only tests
         run: npm test
       - name: Verify committed encrypted GitHub Pages bundle
         run: npm run verify:bundle
+      - name: Verify isolated Firebase demo staging output
+        run: npm run verify:firebase-demo

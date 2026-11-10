@@ -9,7 +9,9 @@
     "build:example": "node scripts/build.mjs --example",
     "serve": "python3 -m http.server 8080 -d docs",
     "test": "node --test tests/*.test.mjs",
-    "verify:bundle": "node scripts/check-published.mjs"
+    "verify:bundle": "node scripts/check-published.mjs",
+    "build:firebase-demo": "node scripts/build-firebase-demo.mjs",
+    "verify:firebase-demo": "node scripts/verify-firebase-demo.mjs"
   },
   "engines": {
     "node": ">=20"
