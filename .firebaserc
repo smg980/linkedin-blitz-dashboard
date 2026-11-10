@@ -1,0 +1,14 @@
+{
+  "projects": {
+    "default": "master-intelligence-5496f"
+  },
+  "targets": {
+    "master-intelligence-5496f": {
+      "hosting": {
+        "blitz": [
+          "master-intelligence-5496f-lb"
+        ]
+      }
+    }
+  }
+}
