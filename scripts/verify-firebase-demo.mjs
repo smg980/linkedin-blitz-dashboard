@@ -28,8 +28,24 @@ export async function verify() {
       map['cache-control'] !== 'no-store')
     throw new Error('Hosting security policy is weakened');
 
-  const filenames = (await fs.readdir(OUT)).sort();
-  const allowed = ['index.html','app.js','theme.css','blitz.css','favicon.ico','fonts','img','data.enc.json'].sort();
+  async function listFiles(relative = '') {
+    const entries = await fs.readdir(path.join(OUT, relative), { withFileTypes: true });
+    const files = [];
+    for (const entry of entries) {
+      const filename = path.posix.join(relative, entry.name);
+      if (entry.isDirectory()) files.push(...await listFiles(filename));
+      else if (entry.isFile()) files.push(filename);
+      else throw new Error('Unexpected Firebase deploy file type: ' + filename);
+    }
+    return files.sort();
+  }
+  const filenames = await listFiles();
+  const allowed = [
+    'index.html','app.js','theme.css','blitz.css','favicon.ico','data.enc.json',
+    'fonts/DMSans-latin.woff2','fonts/Manrope-latin.woff2',
+    'img/apple-touch-icon.png','img/favicon-32.png',
+    'img/logo-header.png','img/logo-header.webp','img/logo-lock.png','img/logo-lock.webp',
+  ].sort();
   if (JSON.stringify(filenames) !== JSON.stringify(allowed)) throw new Error('Unexpected Firebase deploy file');
 
   const html = await fs.readFile(path.join(OUT, 'index.html'), 'utf8');
