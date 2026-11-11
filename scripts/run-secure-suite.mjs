@@ -111,6 +111,23 @@ export function integrationFailure({ execCode, execSignal, output, childStatus }
   const reported = reportedFailCount(text);
   if (reported != null && reported > 0) reasons.push(`integration reported fail ${reported}`);
   if (/^\s*✖\s+\S/m.test(text)) reasons.push('integration reported a failed test');
+  // A zero exit status does not prove the complete, seven-test suite ran.
+  // Require the Node spec reporter's complete summary on this invocation.
+  const expected = { tests: 7, pass: 7, fail: 0, cancelled: 0, skipped: 0, todo: 0 };
+  const summary = Object.create(null);
+  const duplicates = new Set();
+  for (const line of text.split(/\r?\n/)) {
+    if (line.length > 100) continue;
+    const match = line.trim().match(/^(?:ℹ|#)\s*(tests|pass|fail|cancelled|skipped|todo)\s+(\d+)$/);
+    if (!match) continue;
+    const key = match[1];
+    if (Object.hasOwn(summary, key)) duplicates.add(key);
+    summary[key] = Number(match[2]);
+  }
+  if (duplicates.size) reasons.push(`integration summary has duplicate fields: ${[...duplicates].join(', ')}`);
+  for (const [key, value] of Object.entries(expected)) {
+    if (summary[key] !== value) reasons.push(`integration summary requires ${key} ${value}, got ${summary[key] ?? 'missing'}`);
+  }
   if (childStatus == null || !/^\d+$/.test(String(childStatus))) {
     reasons.push('integration child did not record an exit status');
   } else if (Number(childStatus) !== 0) {
