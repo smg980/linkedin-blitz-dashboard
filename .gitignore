@@ -10,4 +10,9 @@ assets-src/
 # Firebase synthetic output must never be committed
 .firebase-blitz-demo/
 .firebase-blitz-demo-tmp/
+.firebase-blitz-private-shell/
+.firebase-blitz-private-shell-tmp/
 .firebase/
+
+# Private shell Firebase web config (copy from secure-config.example.json)
+secure-config.local.json
