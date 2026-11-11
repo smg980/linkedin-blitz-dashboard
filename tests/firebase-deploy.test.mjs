@@ -13,6 +13,8 @@ const listed = ids => JSON.stringify({ status: 'success', result: { sites: ids.m
 test('synthetic Blitz deployment refuses to run without independent approval', () => {
   const env = { ...process.env };
   delete env.BLITZ_APPROVE_SYNTHETIC_DEPLOY;
+  delete env.CI;
+  delete env.GITHUB_ACTIONS;
   const result = spawnSync('bash', ['scripts/deploy-firebase-demo.sh'], {
     env, encoding: 'utf8', timeout: 10000,
   });
