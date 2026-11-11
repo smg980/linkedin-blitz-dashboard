@@ -295,7 +295,7 @@ test('a killed or failed integration child fails the suite even when emulators:e
   assert.equal(integrationFailure({
     execCode: 0,
     execSignal: null,
-    output: 'ℹ tests 1\nℹ pass 1\nℹ fail 0\n✔ Script exited successfully (code 0)\n',
+    output: 'ℹ tests 7\nℹ pass 7\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\n✔ Script exited successfully (code 0)\n',
     childStatus: 0,
   }), null);
   assert.match(integrationFailure({
@@ -330,5 +330,27 @@ test('a killed or failed integration child fails the suite even when emulators:e
     assert.match(integrationFailure({ ...failed, execCode: 0, execSignal: null }), /fail 1/);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+
+test('secure integration rejects incomplete, missing, skipped, cancelled, and duplicated summaries', () => {
+  const base = { execCode: 0, execSignal: null, childStatus: 0 };
+  const summary = ({ tests = 7, pass = 7, fail = 0, cancelled = 0, skipped = 0, todo = 0 } = {}) =>
+    `ℹ tests ${tests}\nℹ pass ${pass}\nℹ fail ${fail}\nℹ cancelled ${cancelled}\nℹ skipped ${skipped}\nℹ todo ${todo}\n✔ Script exited successfully (code 0)\n`;
+  assert.equal(integrationFailure({ ...base, output: summary() }), null);
+  for (const incomplete of [
+    summary({ tests: 0, pass: 0 }),
+    summary({ tests: 1, pass: 1 }),
+    summary({ tests: 6, pass: 6 }),
+    summary({ tests: 7, pass: 6 }),
+    summary({ tests: 7, pass: 6, skipped: 1 }),
+    summary({ tests: 7, pass: 6, cancelled: 1 }),
+    summary({ tests: 7, pass: 6, todo: 1 }),
+    '✔ Script exited successfully (code 0)\n',
+    'ℹ tests 7\nℹ pass 7\nℹ fail 0\n',
+    summary() + summary(),
+  ]) {
+    assert.match(integrationFailure({ ...base, output: incomplete }), /integration summary (requires|has duplicate)/);
   }
 });
