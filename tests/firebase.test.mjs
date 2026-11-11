@@ -109,7 +109,7 @@ test('staged Firebase Blitz unlocks four fictional contacts and navigates read-o
   const queue = node('#view').innerHTML;
   assert.match(queue, /Example Person|Example Contact/i, 'Fictional contacts must render in queue');
   assert.match(queue, /Snapshot only; verify status before sending/);
-  const match = queue.match(/href="#\\/contact\\/([A-Za-z0-9_-]+)"/);
+  const match = queue.match(/href="#\/contact\/([A-Za-z0-9_-]+)"/);
   assert.ok(match, 'Contact queue must navigate to individual fictional contact');
 
   location.hash = '#/contact/' + match[1];
