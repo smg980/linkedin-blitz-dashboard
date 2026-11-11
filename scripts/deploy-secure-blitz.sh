@@ -72,9 +72,18 @@ if ! firebase hosting:sites:list --project "$PROJECT" --json --non-interactive \
   stop 'Site list verification failed.'
 fi
 
-npm test
-npm run verify:bundle
-npm run test:secure
+env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
+    -u BLITZ_APPROVED_COMMIT \
+    -u BLITZ_EXPECTED_DEMO_RELEASE \
+    npm test
+env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
+    -u BLITZ_APPROVED_COMMIT \
+    -u BLITZ_EXPECTED_DEMO_RELEASE \
+    npm run verify:bundle
+env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
+    -u BLITZ_APPROVED_COMMIT \
+    -u BLITZ_EXPECTED_DEMO_RELEASE \
+    npm run test:secure
 node scripts/build-secure-shell.mjs --config "${BLITZ_SECURE_CONFIG:-secure-config.local.json}"
 node scripts/secure-hosting-guard.mjs --assert-shell
 [[ -z "$(git status --porcelain)" ]] || stop 'Build modified tracked files.'

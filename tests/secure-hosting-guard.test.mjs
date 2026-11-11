@@ -37,14 +37,20 @@ function channel(patch = {}) {
   };
 }
 
-function runDeploy(env) {
-  const childEnv = { ...process.env };
-  delete childEnv.CI;
-  delete childEnv.GITHUB_ACTIONS;
-  delete childEnv.DASHBOARD_PASSPHRASE;
-  Object.assign(childEnv, env);
+function cleanChildEnv(overrides = {}, base = process.env) {
+  const env = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (typeof value !== 'string') continue;
+    if (key.startsWith('BLITZ_') || /PASSPHRASE/i.test(key)) continue;
+    if (key === 'CI' || key === 'GITHUB_ACTIONS' || key === 'FIREBASE_TOKEN' || key === 'GOOGLE_APPLICATION_CREDENTIALS') continue;
+    env[key] = value;
+  }
+  return { ...env, ...overrides };
+}
+
+function runDeploy(overrides = {}, base = process.env) {
   return spawnSync('bash', ['scripts/deploy-secure-blitz.sh'], {
-    env: childEnv, encoding: 'utf8', timeout: 10000,
+    env: cleanChildEnv(overrides, base), encoding: 'utf8', timeout: 10000,
   });
 }
 
@@ -152,7 +158,7 @@ test('live channel release is exact and rejects lists, wrong sites, and unrestor
 
 test('release cli prints only the clone id and drops account identifiers', () => {
   const good = spawnSync(process.execPath, ['scripts/secure-hosting-guard.mjs', '--release'], {
-    input: JSON.stringify(channel()), encoding: 'utf8',
+    input: JSON.stringify(channel()), encoding: 'utf8', env: cleanChildEnv(),
   });
   assert.equal(good.status, 0);
   assert.equal(good.stdout, [
@@ -163,20 +169,20 @@ test('release cli prints only the clone id and drops account identifiers', () =>
   ].join('\n'));
   assert.doesNotMatch(`${good.stdout}${good.stderr}`, /release-user@example.com|apiKey|ya29/);
   const paged = spawnSync(process.execPath, ['scripts/secure-hosting-guard.mjs', '--release'], {
-    input: JSON.stringify({ releases: [channel().release], nextPageToken: 'next' }), encoding: 'utf8',
+    input: JSON.stringify({ releases: [channel().release], nextPageToken: 'next' }), encoding: 'utf8', env: cleanChildEnv(),
   });
   assert.notEqual(paged.status, 0);
   assert.match(paged.stderr, /not a paged list/);
   assert.equal(paged.stdout, '');
   const configured = spawnSync(process.execPath, ['scripts/secure-hosting-guard.mjs', '--assert-config'], {
-    encoding: 'utf8',
+    encoding: 'utf8', env: cleanChildEnv(),
   });
   assert.equal(configured.status, 0, configured.stderr);
   assert.match(configured.stdout, /hosting:blitz/);
 });
 
 test('secure deploy script can target only hosting:blitz and prints an exact clone rollback', () => {
-  assert.equal(spawnSync('bash', ['-n', 'scripts/deploy-secure-blitz.sh'], { encoding: 'utf8' }).status, 0);
+  assert.equal(spawnSync('bash', ['-n', 'scripts/deploy-secure-blitz.sh'], { encoding: 'utf8', env: cleanChildEnv() }).status, 0);
   assert.deepEqual(scriptCode.match(/firebase deploy[^\n]*/g), [
     'firebase deploy --config firebase.secure-blitz.json --only "hosting:$TARGET" --project "$PROJECT" --non-interactive',
   ]);
@@ -193,27 +199,48 @@ test('secure deploy script can target only hosting:blitz and prints an exact clo
   assert.match(scriptCode, /-H @"\$token_file"/);
   assert.match(scriptCode, /Concurrent Hosting change detected/);
   assert.match(scriptCode, /deploy_verified=1/);
+  const isolated = 'env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \\\n    -u BLITZ_APPROVED_COMMIT \\\n    -u BLITZ_EXPECTED_DEMO_RELEASE \\\n    ';
+  for (const command of ['npm test', 'npm run verify:bundle', 'npm run test:secure']) {
+    assert.ok(scriptCode.includes(isolated + command), command);
+  }
 });
 
-test('secure deploy refuses CI, a missing opt-in, a passphrase, and the wrong commit', () => {
-  const missing = runDeploy({});
+function assertDeployRefusals(base) {
+  const missing = runDeploy({}, base);
   assert.notEqual(missing.status, 0);
   assert.match(missing.stderr, /Explicit Step C opt-in is required/);
-  const ci = spawnSync('bash', ['scripts/deploy-secure-blitz.sh'], {
-    env: { ...process.env, CI: 'true', BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES' },
-    encoding: 'utf8',
-    timeout: 10000,
-  });
+  assert.doesNotMatch(`${missing.stdout}\n${missing.stderr}`, /STEP_C: deploying|firebase deploy --config|recursive/);
+  const ci = runDeploy({ CI: 'true', BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES' }, base);
   assert.notEqual(ci.status, 0);
   assert.match(ci.stderr, /Never deploy from CI/);
   assert.doesNotMatch(`${ci.stdout}\n${ci.stderr}`, /STEP_C: deploying|firebase deploy --config/);
   const secret = 'synthetic-review-passphrase';
-  const passphrase = runDeploy({ BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES', DASHBOARD_PASSPHRASE: secret });
+  const passphrase = runDeploy({ BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES', DASHBOARD_PASSPHRASE: secret }, base);
   assert.notEqual(passphrase.status, 0);
   assert.match(passphrase.stderr, /No campaign passphrase/);
   assert.doesNotMatch(`${passphrase.stdout}\n${passphrase.stderr}`, new RegExp(secret));
-  const wrong = runDeploy({ BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES', BLITZ_APPROVED_COMMIT: '0000000000000000000000000000000000000000' });
+  const wrong = runDeploy({ BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES', BLITZ_APPROVED_COMMIT: '0000000000000000000000000000000000000000' }, base);
   assert.notEqual(wrong.status, 0);
   assert.match(wrong.stderr, /not the approved commit/);
   assert.doesNotMatch(`${wrong.stdout}\n${wrong.stderr}`, /STEP_C: deploying|firebase deploy --config/);
+}
+
+test('secure deploy refuses CI, a missing opt-in, a passphrase, and the wrong commit', () => {
+  assertDeployRefusals(process.env);
+});
+
+test('refusal cases ignore operator approval variables inherited from the parent', () => {
+  const parent = {
+    ...process.env,
+    BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES',
+    BLITZ_APPROVED_COMMIT: 'efea80ad8156a0756d0a329a3f7a7ebc5a8a8713',
+    BLITZ_EXPECTED_DEMO_RELEASE: 'sites/x/channels/live/releases/1',
+    BLITZ_SYNTHETIC_PASSPHRASE: 'parent-synthetic-passphrase',
+    DASHBOARD_PASSPHRASE: 'parent-passphrase-must-not-leak',
+    FIREBASE_TOKEN: 'parent-firebase-token',
+    GOOGLE_APPLICATION_CREDENTIALS: '/tmp/parent-adc.json',
+    CI: 'true',
+    GITHUB_ACTIONS: 'true',
+  };
+  assertDeployRefusals(parent);
 });
