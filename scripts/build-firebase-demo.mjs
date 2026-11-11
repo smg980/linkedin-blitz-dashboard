@@ -11,7 +11,25 @@ const DOCS = path.join(ROOT, 'docs');
 const OUT = path.join(ROOT, '.firebase-blitz-demo');
 const TEMP = path.join(ROOT, '.firebase-blitz-demo-tmp');
 export const DEMO_PASSPHRASE = 'SYNTHETIC-BLITZ-DEMO-ONLY-2026';
-const ASSETS = ['index.html', 'app.js', 'theme.css', 'blitz.css', 'favicon.ico', 'fonts', 'img'];
+const ASSETS = [
+  'index.html', 'app.js', 'theme.css', 'blitz.css', 'favicon.ico',
+  'fonts/DMSans-latin.woff2', 'fonts/Manrope-latin.woff2',
+  'img/apple-touch-icon.png', 'img/favicon-32.png',
+  'img/logo-header.png', 'img/logo-header.webp',
+  'img/logo-lock.png', 'img/logo-lock.webp',
+];
+
+async function listFiles(root, relative = '') {
+  const entries = await fs.readdir(path.join(root, relative), { withFileTypes: true });
+  const paths = [];
+  for (const entry of entries) {
+    const file = path.posix.join(relative, entry.name);
+    if (entry.isDirectory()) paths.push(...await listFiles(root, file));
+    else if (entry.isFile()) paths.push(file);
+    else throw new Error('Unsupported file type in Firebase output: ' + file);
+  }
+  return paths.sort();
+}
 
 async function run() {
   if (process.env.DASHBOARD_PASSPHRASE) {
@@ -21,7 +39,9 @@ async function run() {
   await fs.mkdir(TEMP, { recursive: true });
   try {
     for (const asset of ASSETS) {
-      await fs.cp(path.join(DOCS, asset), path.join(TEMP, asset), { recursive: true });
+      const outputFile = path.join(TEMP, asset);
+      await fs.mkdir(path.dirname(outputFile), { recursive: true });
+      await fs.copyFile(path.join(DOCS, asset), outputFile);
     }
     let html = await fs.readFile(path.join(TEMP, 'index.html'), 'utf8');
     if (!html.includes('<h1>LinkedIn Blitz</h1>')) throw new Error('Unexpected lock-screen markup');
@@ -45,7 +65,7 @@ async function run() {
     if (content.alg !== 'AES-256-GCM' || content.iterations !== 600000 || Object.keys(content).length !== 7) {
       throw new Error('Synthetic ciphertext did not pass the expected envelope check');
     }
-    const files = (await fs.readdir(TEMP)).sort();
+    const files = await listFiles(TEMP);
     const allowed = [...ASSETS, 'data.enc.json'].sort();
     if (JSON.stringify(files) !== JSON.stringify(allowed)) throw new Error('Unexpected file in synthetic Hosting build');
     await fs.rm(OUT, { recursive: true, force: true });
