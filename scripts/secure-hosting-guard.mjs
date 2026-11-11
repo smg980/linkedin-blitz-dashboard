@@ -53,7 +53,7 @@ export function latestRelease(text) {
   if (!Array.isArray(list) || !list.length) throw new Error('No Hosting releases were returned');
   if (list.length !== 1) throw new Error('Expected exactly one release from pageSize=1');
   const release = list[0];
-  if (typeof release.name !== 'string' || !release.name.startsWith(`sites/${SITE}/channels/live/releases/`)) {
+  if (typeof release.name !== 'string' || ![ `sites/${SITE}/channels/live/releases/`, `sites/${SITE}/releases/` ].some(prefix => release.name.startsWith(prefix))) {
     throw new Error('Release is not in the dedicated live channel');
   }
   if (typeof release.version?.name !== 'string' || !release.version.name.startsWith(`sites/${SITE}/versions/`)) {
