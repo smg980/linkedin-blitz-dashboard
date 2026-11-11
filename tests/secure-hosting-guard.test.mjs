@@ -29,6 +29,7 @@ test('built production shell rejects wrong project/emulator/extra secrets', () =
 
 test('rollback baseline requires live-channel exact version', () => {
   assert.equal(latestRelease(JSON.stringify(release)).version, `sites/${site}/versions/456`);
+  assert.equal(latestRelease(JSON.stringify({releases:[{...release.releases[0],name:`sites/${site}/releases/123`}]})).version, `sites/${site}/versions/456`);
   assert.throws(()=>latestRelease(JSON.stringify({releases:[]})));
   assert.throws(()=>latestRelease(JSON.stringify({releases:[{...release.releases[0],name:'sites/other/channels/live/releases/1'}]})));
   assert.throws(()=>latestRelease(JSON.stringify({releases:[{...release.releases[0],version:{name:'sites/other/versions/123'}}]})));
