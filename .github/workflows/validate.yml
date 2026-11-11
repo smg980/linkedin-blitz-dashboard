@@ -32,6 +32,7 @@ jobs:
           node --check scripts/verify-firebase-demo.mjs
           node --check tests/firebase.test.mjs
           node --check tests/firebase-deploy.test.mjs
+          node --check tests/mobile-layout.test.mjs
       - name: Run synthetic-only tests
         run: npm test
       - name: Verify committed encrypted GitHub Pages bundle
