@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { verify } from '../scripts/verify-firebase-demo.mjs';
@@ -25,4 +26,19 @@ test('synthetic builder rejects accidentally inherited production credentials', 
   });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Do not run the synthetic Firebase builder with a real dashboard passphrase/);
+});
+
+test('Firebase preview rejects extra nested assets rather than hiding them in copied directories', async () => {
+  const env = { ...process.env };
+  delete env.DASHBOARD_PASSPHRASE;
+  const result = spawnSync(process.execPath, [builder], { cwd: root, env, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const extraneous = path.join(root, '.firebase-blitz-demo', 'img', 'unexpected-export.csv');
+  await fs.writeFile(extraneous, 'synthetic-test-only');
+  try {
+    await assert.rejects(verify(), /Unexpected Firebase deploy file/);
+  } finally {
+    await fs.rm(extraneous, { force: true });
+  }
+  await verify();
 });
