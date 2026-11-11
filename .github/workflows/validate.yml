@@ -30,6 +30,7 @@ jobs:
           node --check scripts/check-published.mjs
           node --check scripts/build-firebase-demo.mjs
           node --check scripts/verify-firebase-demo.mjs
+          node --check scripts/blitz-hosting-guard.mjs
           node --check tests/firebase.test.mjs
           node --check tests/firebase-deploy.test.mjs
           node --check tests/mobile-layout.test.mjs

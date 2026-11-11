@@ -1,7 +1,9 @@
 # LinkedIn Blitz → Firebase alongside Meeting Prep
 
-**Status: engineering staging only; not deployed.** Date: November 9, 2026.
+**Status: engineering staging only; not deployed.** Date: November 9, 2026. Operator commands were written on November 11, 2026 and are still not authorized to run.
 The existing GitHub Pages production dashboard stays live with its current encrypted November campaign until private-access acceptance.
+
+The exact site-create, target, deploy, live-check, and rollback commands are in [SYNTHETIC_HOSTING_RUNBOOK.md](SYNTHETIC_HOSTING_RUNBOOK.md). Do not run them from this document. The private November-campaign design is [SECURE_PRODUCTION_MIGRATION.md](SECURE_PRODUCTION_MIGRATION.md). It is design only and is separate from the fictional demo.
 
 ## Intended topology
 
