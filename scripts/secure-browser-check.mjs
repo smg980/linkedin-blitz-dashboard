@@ -278,7 +278,7 @@ export async function checkSecureShell({ shellDir, passphrase, artifactsDir, own
 
     for (const req of firestoreRequests) {
       const pathname = new URL(req.url).pathname;
-      if (req.method !== 'GET' || !/\/documents\/linkedinBlitzPrivate\/[^/]+$/.test(pathname)) {
+      if (req.method !== 'GET' || !/\/documents\/blitzOwners\/[^/]+\/campaign\/current$/.test(pathname)) {
         throw new Error('Client made a Firestore request other than a single-document get: ' + req.method + ' ' + req.url);
       }
     }

@@ -5,7 +5,7 @@ export async function writeSyntheticEnvelope({ projectId, uid, envelope }) {
   const app = initializeApp({ projectId }, `synthetic-${uid}`);
   try {
     const db = getFirestore(app);
-    await db.doc(`linkedinBlitzPrivate/${uid}`).set(envelope);
+    await db.doc(`blitzOwners/${uid}/campaign/current`).set(envelope);
   } finally {
     await Promise.race([
       deleteApp(app),

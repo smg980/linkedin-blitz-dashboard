@@ -2,7 +2,7 @@
 
 This directory is the source for a Firebase Hosting app shell. The built site contains HTML, CSS, JavaScript, fonts, and images. It does not contain a campaign file or ciphertext.
 
-After Google sign-in the browser reads one Firestore document, `linkedinBlitzPrivate/{signed-in uid}`, with a single get. The document holds the same client-side AES-256-GCM envelope the public dashboard already uses. The passphrase is typed into the page and decryption stays in the browser. Lock and sign-out drop the decrypted value from the page. The passphrase and the decrypted campaign are not written to web storage.
+After Google sign-in the browser force-refreshes the ID token once, then reads one Firestore document, `blitzOwners/{signed-in uid}/campaign/current`, with a single get. It never lists or queries. The document holds the same client-side AES-256-GCM envelope the public dashboard already uses. The passphrase is typed into the page and decryption stays in the browser. A missing document or a permission denial shows not authorized. Lock and sign-out drop the decrypted value from the page. The passphrase and the decrypted campaign are not written to web storage.
 
 The client does not write to Firestore, does not list the collection, and does not send LinkedIn messages or status changes.
 

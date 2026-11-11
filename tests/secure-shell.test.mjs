@@ -96,6 +96,7 @@ test('private document reads are a single get', async () => {
     method: 'GET',
   }]);
   assert.equal(calls[0].url.includes('?'), false);
+  assert.match(calls[0].url, /\/documents\/blitzOwners\/owneruid\/campaign\/current$/);
   const missing = await readPrivateDocument({
     origin: 'https://firestore.googleapis.com',
     projectId: 'demo-blitz-secure',
@@ -141,6 +142,11 @@ test('shell source is read-only and does not touch web storage', async () => {
   assert.match(src, /signInWithRedirect/);
   assert.match(src, /shouldUseRedirectFirst/);
   assert.match(src, /readPrivateDocument/);
+  assert.match(src, /getIdToken\(true\)/);
+  const reader = await fs.readFile(path.join(root, 'secure', 'firestore-get.mjs'), 'utf8');
+  assert.match(reader, /blitzOwners\/\$\{uid\}\/campaign\/current/);
+  assert.doesNotMatch(reader, /linkedinBlitzPrivate/);
+  assert.match(await fs.readFile(path.join(root, 'scripts', 'run-secure-suite.mjs'), 'utf8'), /request\.auth\.token\.blitzOwner == true/);
   assert.doesNotMatch(src, /firebase\/firestore|localStorage|sessionStorage|indexedDB|setDoc|updateDoc|addDoc|deleteDoc|writeBatch|getDocs|onSnapshot|collection\(|query\(/);
   const deploy = await fs.readFile(path.join(root, 'scripts', 'deploy-firebase-demo.sh'), 'utf8');
   assert.doesNotMatch(deploy, /firebase\.secure-blitz|private-shell|ingest-synthetic/);

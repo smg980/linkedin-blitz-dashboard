@@ -47,15 +47,39 @@ async function createGoogleUser(email, sub, name) {
   return { uid: body.localId, idToken: body.idToken, email };
 }
 
+async function grantOwnerClaim(uid) {
+  const response = await fetch(`http://${authHost}/identitytoolkit.googleapis.com/v1/accounts:update`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer owner', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ localId: uid, customAttributes: JSON.stringify({ blitzOwner: true }) }),
+  });
+  assert.equal(response.status, 200, 'Auth emulator did not set the synthetic owner claim');
+}
+
+function tokenPayload(idToken) {
+  return JSON.parse(Buffer.from(idToken.split('.')[1], 'base64url').toString('utf8'));
+}
+
 function docUrl(uid) {
-  const suffix = uid ? `/${uid}` : '';
-  return `http://${firestoreHost}/v1/projects/${PROJECT}/databases/(default)/documents/linkedinBlitzPrivate${suffix}`;
+  return `http://${firestoreHost}/v1/projects/${PROJECT}/databases/(default)/documents/blitzOwners/${uid}/campaign/current`;
 }
 
 describe('private shell emulators', { concurrency: false }, () => {
   before(async () => {
     users.owner = await createGoogleUser(OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner');
     users.intruder = await createGoogleUser(INTRUDER_EMAIL, 'synthetic-intruder-sub-001', 'Synthetic Intruder');
+    await grantOwnerClaim(users.owner.uid);
+    const claimed = await createGoogleUser(OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner');
+    assert.equal(claimed.uid, users.owner.uid);
+    users.owner.idToken = claimed.idToken;
+    const ownerToken = tokenPayload(users.owner.idToken);
+    const intruderToken = tokenPayload(users.intruder.idToken);
+    assert.equal(ownerToken.blitzOwner, true);
+    assert.equal(ownerToken.email_verified, true);
+    assert.equal(ownerToken.firebase.sign_in_provider, 'google.com');
+    assert.notEqual(intruderToken.blitzOwner, true);
+    assert.equal(intruderToken.email_verified, true);
+    assert.equal(intruderToken.firebase.sign_in_provider, 'google.com');
     const ingested = spawnSync(process.execPath, [
       path.join(root, 'scripts', 'ingest-synthetic-emulator.mjs'),
       '--project', PROJECT,
@@ -73,7 +97,7 @@ describe('private shell emulators', { concurrency: false }, () => {
     assert.equal(built.status, 0, built.stderr || built.stdout);
   }, { timeout: 180000 });
 
-  test('owner can read only their encrypted document', async () => {
+  test('owner with the claim can read their encrypted document', async () => {
     const response = await fetch(docUrl(users.owner.uid), { headers: { Authorization: `Bearer ${users.owner.idToken}` } });
     assert.equal(response.status, 200);
     const raw = await response.text();
@@ -84,11 +108,14 @@ describe('private shell emulators', { concurrency: false }, () => {
     assert.equal(data.example, true);
   });
 
-  test('another synthetic user cannot read the owner document', async () => {
-    const response = await fetch(docUrl(users.owner.uid), { headers: { Authorization: `Bearer ${users.intruder.idToken}` } });
+  test('a verified Google user without the claim is denied on their own path', async () => {
+    const response = await fetch(docUrl(users.intruder.uid), { headers: { Authorization: `Bearer ${users.intruder.idToken}` } });
     assert.equal(response.status, 403);
-    const own = await fetch(docUrl(users.intruder.uid), { headers: { Authorization: `Bearer ${users.intruder.idToken}` } });
-    assert.equal(own.status, 404);
+  });
+
+  test('a claim holder cannot read another uid path', async () => {
+    const response = await fetch(docUrl(users.intruder.uid), { headers: { Authorization: `Bearer ${users.owner.idToken}` } });
+    assert.equal(response.status, 403);
   });
 
   test('a signed-out read is denied', async () => {
@@ -97,8 +124,11 @@ describe('private shell emulators', { concurrency: false }, () => {
   });
 
   test('listing the private collection is denied', async () => {
-    const response = await fetch(docUrl(''), { headers: { Authorization: `Bearer ${users.owner.idToken}` } });
-    assert.equal(response.status, 403);
+    const headers = { Authorization: `Bearer ${users.owner.idToken}` };
+    const rootList = await fetch(`http://${firestoreHost}/v1/projects/${PROJECT}/databases/(default)/documents/blitzOwners`, { headers });
+    const campaignList = await fetch(`http://${firestoreHost}/v1/projects/${PROJECT}/databases/(default)/documents/blitzOwners/${users.owner.uid}/campaign`, { headers });
+    assert.equal(rootList.status, 403);
+    assert.equal(campaignList.status, 403);
   });
 
   test('client writes are denied', async () => {

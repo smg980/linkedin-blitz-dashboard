@@ -125,7 +125,8 @@ async function readSignedInDocument(user, gen) {
   session.signInStart();
   render();
   try {
-    const token = await user.getIdToken();
+    // One forced refresh so a claim granted after the first token is visible.
+    const token = await user.getIdToken(true);
     if (gen !== generation) return;
     const result = await readPrivateDocument({
       origin: firestoreOrigin(),

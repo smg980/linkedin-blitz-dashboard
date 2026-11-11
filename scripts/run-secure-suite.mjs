@@ -16,8 +16,12 @@ service cloud.firestore {
     match /{document=**} {
       allow read, write: if false;
     }
-    match /linkedinBlitzPrivate/{uid} {
-      allow get: if request.auth != null && request.auth.uid == uid;
+    match /blitzOwners/{uid}/campaign/current {
+      allow get: if request.auth != null
+        && request.auth.token.firebase.sign_in_provider == 'google.com'
+        && request.auth.token.email_verified == true
+        && request.auth.uid == uid
+        && request.auth.token.blitzOwner == true;
       allow list, create, update, delete: if false;
     }
   }

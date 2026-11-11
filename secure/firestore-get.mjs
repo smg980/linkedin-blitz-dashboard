@@ -4,7 +4,7 @@ export function privateDocumentUrl({ origin, projectId, uid }) {
   if (!/^https?:\/\/[^/]+$/.test(origin)) throw new Error('Unexpected Firestore origin');
   if (!/^[A-Za-z0-9_-]+$/.test(projectId)) throw new Error('Unexpected project id');
   if (!/^[A-Za-z0-9_-]+$/.test(uid)) throw new Error('Unexpected uid');
-  return `${origin}/v1/projects/${projectId}/databases/(default)/documents/linkedinBlitzPrivate/${uid}`;
+  return `${origin}/v1/projects/${projectId}/databases/(default)/documents/blitzOwners/${uid}/campaign/current`;
 }
 
 export function envelopeFromFirestoreFields(fields) {
