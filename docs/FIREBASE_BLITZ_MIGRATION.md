@@ -26,6 +26,36 @@ firebase emulators:start --only hosting:blitz --project master-intelligence-5496
 
 GitHub CI runs tests, verifies that the app is synthetic after decrypting with the demo key, confirms the production ciphertext wasn't copied, checks the deploy allowlist and validates the Hosting security headers. **Do not deploy any production campaign ciphertext from this branch.** No GitHub Actions deploy permissions or Firebase credentials are configured or required for tests.
 
+### Reviewed future synthetic release path (code only)
+
+The staging builder now copies an **explicit list of individual files** rather
+than whole asset directories. The verifier independently enumerates all nested
+files in the output and rejects anything outside that list, including a stray
+file under `img/` or `fonts/`. A dedicated regression test checks this.
+
+A separate `scripts/deploy-firebase-demo.sh` is prepared for a **future,
+separately approved** fictional-data test release. It is **not** run by
+GitHub Actions or on `npm test`, and it will fail unless all these gates pass:
+
+- `BLITZ_APPROVE_SYNTHETIC_DEPLOY=YES` was deliberately set by the
+  authorized operator for this one release; no real dashboard passphrase
+  may be in the environment.
+- The exact project/target mapping remains `master-intelligence-5496f`
+  / `hosting:blitz` / `master-intelligence-5496f-lb`.
+- Local synthetic tests, current committed ciphertext *format* checks,
+  synthetic build, full recursive file allowlist, and fictional payload
+  decryption checks succeed.
+- The dedicated Blitz Hosting site **already exists**. This script does not
+  create it or grant any access.
+- The final CLI command is only
+  `firebase deploy --only hosting:blitz --project master-intelligence-5496f --non-interactive`.
+
+**No live site exists merely because the script is prepared.** Site creation,
+domain configuration and any synthetic deployment remain a separate
+owner-approved Cloud-side step. The real LinkedIn campaign stays solely
+on GitHub Pages; its existing encrypted file is never part of this
+synthetic Firebase staging directory.
+
 ### Firebase side effects not performed
 
 - Did not create or delete a Firebase Hosting site, configure DNS, deploy to Firebase, or edit the MASTER or Meeting Prep site.
