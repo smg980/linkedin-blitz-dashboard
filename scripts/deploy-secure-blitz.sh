@@ -65,31 +65,32 @@ command -v node >/dev/null || stop 'node missing.'
 command -v sha256sum >/dev/null || stop 'sha256sum missing.'
 [[ -f "${BLITZ_SECURE_CONFIG:-secure-config.local.json}" ]] || stop 'Untracked Firebase WEB config missing; do not create credentials.'
 
-node scripts/secure-hosting-guard.mjs --assert-config
-require_billing_off 'Billing is not verified OFF.'
+node scripts/secure-hosting-guard.mjs --assert-config || stop 'Private Hosting config check failed.'
+require_billing_off 'Billing is not verified OFF.' || stop 'Billing is not verified OFF.'
 if ! firebase hosting:sites:list --project "$PROJECT" --json --non-interactive \
     | node scripts/secure-hosting-guard.mjs --require-site; then
   stop 'Site list verification failed.'
 fi
 
+# Stop on the failing check itself. set -e must not be the only gate.
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
-    npm test
+    npm test || stop 'npm test failed.'
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
-    npm run verify:bundle
+    npm run verify:bundle || stop 'verify:bundle failed.'
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
-    npm run test:secure
-node scripts/build-secure-shell.mjs --config "${BLITZ_SECURE_CONFIG:-secure-config.local.json}"
-node scripts/secure-hosting-guard.mjs --assert-shell
+    npm run test:secure || stop 'test:secure failed.'
+node scripts/build-secure-shell.mjs --config "${BLITZ_SECURE_CONFIG:-secure-config.local.json}" || stop 'Secure shell build failed.'
+node scripts/secure-hosting-guard.mjs --assert-shell || stop 'Secure shell output check failed.'
 [[ -z "$(git status --porcelain)" ]] || stop 'Build modified tracked files.'
 [[ "$(git rev-parse HEAD)" == "$BLITZ_APPROVED_COMMIT" ]] || stop 'Checkout drift after tests.'
-node scripts/secure-hosting-guard.mjs --assert-config
-node scripts/secure-hosting-guard.mjs --assert-shell
+node scripts/secure-hosting-guard.mjs --assert-config || stop 'Private Hosting config check failed.'
+node scripts/secure-hosting-guard.mjs --assert-shell || stop 'Secure shell output check failed.'
 
 write_token() {
   if [[ -z "$token_file" ]]; then
@@ -148,8 +149,8 @@ previous_version="$(printf '%s\n' "$previous" | sed -n '2p')"
 previous_version_id="$(printf '%s\n' "$previous" | sed -n '3p')"
 validate_release_fields "$previous_release" "$previous_version" "$previous_version_id" || stop 'Invalid rollback source.'
 [[ "${BLITZ_EXPECTED_DEMO_RELEASE:-}" == "$previous_release" ]] || stop "Current live release does not equal the explicitly verified fictional-demo release. Captured: ${previous_release}"
-verify_demo_sha
-require_billing_off 'Billing changed before deploy.'
+verify_demo_sha || stop 'Cannot verify existing fictional demo.'
+require_billing_off 'Billing changed before deploy.' || stop 'Billing changed before deploy.'
 capture_live || stop 'Could not re-read the live Hosting release.'
 [[ "$captured" == "$previous" ]] || stop 'Concurrent Hosting change detected.'
 

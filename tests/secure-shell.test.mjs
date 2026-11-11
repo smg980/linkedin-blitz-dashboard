@@ -13,6 +13,8 @@ import { applyDocumentRead, createSession } from '../secure/session.mjs';
 import { syntheticPayload } from '../secure/synthetic-contacts.mjs';
 import { wipePrivateRoot } from '../secure/wipe.mjs';
 import { buildSecureShell } from '../scripts/build-secure-shell.mjs';
+import { CHROME_REQUIRED, checkSecureShell, findChrome } from '../scripts/secure-browser-check.mjs';
+import { integrationFailure, launcherSource, runRecordedIntegration, runSignalKilledIntegration } from '../scripts/run-secure-suite.mjs';
 import { FORBIDDEN_SNIPPETS, SECURE_OUT, SECURE_SHELL_FILES, verifySecureShell } from '../scripts/verify-secure-shell.mjs';
 import { productionCsp } from '../secure/csp.mjs';
 
@@ -252,4 +254,81 @@ test('verify:secure-shell builds the emulator shell when output is missing', asy
   assert.match(result.stdout, /no campaign ciphertext/);
   const proof = await verifySecureShell(SECURE_OUT);
   assert.equal(proof.files, SECURE_SHELL_FILES.length);
+});
+
+test('missing Chrome fails fast and explains how to provide it', async () => {
+  await assert.rejects(findChrome({ chromePath: '/no/such/chrome-for-secure-gate' }), /CHROME_PATH/);
+  await assert.rejects(findChrome({ chromePath: '/no/such/chrome-for-secure-gate' }), /Playwright chromium/);
+  assert.match(CHROME_REQUIRED, /npx playwright install chromium/);
+  const started = Date.now();
+  await assert.rejects(() => checkSecureShell({
+    shellDir: root,
+    passphrase: 'synthetic',
+    artifactsDir: os.tmpdir(),
+    ownerEmail: 'owner-synthetic@example.com',
+    intruderEmail: 'intruder-synthetic@example.com',
+    chromePath: '/no/such/chrome-for-secure-gate',
+  }), /CHROME_PATH/);
+  assert.ok(Date.now() - started < 5000, 'missing Chrome hung instead of failing');
+  const live = await fs.readFile(path.join(root, 'tests', 'secure-live.integration.mjs'), 'utf8');
+  assert.match(live, /test\('built shell states fit an iPhone viewport'/);
+  assert.doesNotMatch(live, /test\.skip\('built shell states fit an iPhone viewport'/);
+  const source = launcherSource({ testFile: '/tmp/t.mjs', statusPath: '/tmp/s' });
+  assert.match(source, /--test-force-exit/);
+  assert.match(source, /--test-timeout=180000/);
+});
+
+test('missing Chrome makes test:secure exit nonzero before emulators start', { timeout: 30000 }, () => {
+  const result = spawnSync(process.execPath, [path.join(root, 'scripts', 'run-secure-suite.mjs')], {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 20000,
+    env: { ...process.env, CHROME_PATH: '/no/such/chrome-for-secure-gate' },
+  });
+  assert.notEqual(result.status, 0, result.stderr || result.stdout);
+  assert.match(`${result.stdout}\n${result.stderr}`, /CHROME_PATH/);
+  assert.match(`${result.stdout}\n${result.stderr}`, /Playwright chromium/);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /emulators: Starting|Running script/);
+});
+
+test('a killed or failed integration child fails the suite even when emulators:exec exits 0', { timeout: 30000 }, async () => {
+  assert.equal(integrationFailure({
+    execCode: 0,
+    execSignal: null,
+    output: 'ℹ tests 1\nℹ pass 1\nℹ fail 0\n✔ Script exited successfully (code 0)\n',
+    childStatus: 0,
+  }), null);
+  assert.match(integrationFailure({
+    execCode: 0,
+    execSignal: null,
+    output: '✖ built shell states fit an iPhone viewport\nℹ fail 1\n',
+    childStatus: 0,
+  }), /fail 1/);
+  assert.match(integrationFailure({
+    execCode: 0,
+    execSignal: null,
+    output: 'Script exited unsuccessfully (code 1)\n',
+    childStatus: 0,
+  }), /emulators:exec reported a script failure/);
+  assert.match(integrationFailure({
+    execCode: 0,
+    execSignal: 'SIGKILL',
+    output: '',
+    childStatus: null,
+  }), /killed by SIGKILL/);
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'blitz-suite-gate-'));
+  try {
+    const failFile = path.join(dir, 'fail.test.mjs');
+    await fs.writeFile(failFile, "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('nope', () => { assert.equal(1, 2); });\n");
+    const killed = await runSignalKilledIntegration();
+    assert.equal(killed.childStatus, 137, JSON.stringify(killed));
+    assert.match(integrationFailure({ ...killed, execCode: 0, execSignal: null }), /integration child exited 137/);
+    const failed = await runRecordedIntegration(failFile);
+    assert.notEqual(failed.childStatus, 0);
+    assert.match(failed.output, /fail 1/);
+    assert.match(integrationFailure({ ...failed, execCode: 0, execSignal: null }), /fail 1/);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });

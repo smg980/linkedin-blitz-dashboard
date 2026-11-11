@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertSecureTarget, assertPrivateWebConfig, currentLiveRelease } from '../scripts/secure-hosting-guard.mjs';
 
 const site = 'master-intelligence-5496f-lb';
@@ -200,9 +204,16 @@ test('secure deploy script can target only hosting:blitz and prints an exact clo
   assert.match(scriptCode, /Concurrent Hosting change detected/);
   assert.match(scriptCode, /deploy_verified=1/);
   const isolated = 'env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \\\n    -u BLITZ_APPROVED_COMMIT \\\n    -u BLITZ_EXPECTED_DEMO_RELEASE \\\n    ';
-  for (const command of ['npm test', 'npm run verify:bundle', 'npm run test:secure']) {
-    assert.ok(scriptCode.includes(isolated + command), command);
+  for (const [command, message] of [
+    ['npm test', 'npm test failed.'],
+    ['npm run verify:bundle', 'verify:bundle failed.'],
+    ['npm run test:secure', 'test:secure failed.'],
+  ]) {
+    assert.ok(scriptCode.includes(`${isolated}${command} || stop '${message}'`), command);
   }
+  assert.equal([...scriptCode.matchAll(/secure-hosting-guard\.mjs --assert-config \|\| stop 'Private Hosting config check failed\.'/g)].length, 2);
+  assert.equal([...scriptCode.matchAll(/secure-hosting-guard\.mjs --assert-shell \|\| stop 'Secure shell output check failed\.'/g)].length, 2);
+  assert.match(scriptCode, /build-secure-shell\.mjs --config "\$\{BLITZ_SECURE_CONFIG:-secure-config\.local\.json\}" \|\| stop 'Secure shell build failed\.'/);
 });
 
 function assertDeployRefusals(base) {
@@ -243,4 +254,158 @@ test('refusal cases ignore operator approval variables inherited from the parent
     GITHUB_ACTIONS: 'true',
   };
   assertDeployRefusals(parent);
+});
+
+async function writeExecutable(file, body) {
+  await writeFile(file, body, { mode: 0o755 });
+  await chmod(file, 0o755);
+}
+
+async function deployStopsBeforeFirebase(mode) {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'blitz-deploy-gate-'));
+  const bin = path.join(dir, 'bin');
+  await mkdir(bin);
+  const firebaseLog = path.join(dir, 'firebase.log');
+  const npmLog = path.join(dir, 'npm.log');
+  const sites = path.join(dir, 'sites.json');
+  const config = path.join(dir, 'secure-config.json');
+  const killed = path.join(dir, 'killed-gate.mjs');
+  const approved = '1111111111111111111111111111111111111111';
+  await writeFile(config, '{}\n');
+  await writeFile(firebaseLog, '');
+  await writeFile(npmLog, '');
+  await writeFile(sites, JSON.stringify({
+    status: 'success',
+    result: {
+      sites: [
+        'master-intelligence-5496f',
+        'master-intelligence-5496f-app',
+        'master-intelligence-5496f-prep',
+        'master-intelligence-5496f-lb',
+      ].map((id) => ({ name: `projects/master-intelligence-5496f/sites/${id}` })),
+    },
+  }));
+  const suite = path.join(root, 'scripts', 'run-secure-suite.mjs');
+  await writeFile(killed, `import { integrationFailure, runRecordedIntegration, runSignalKilledIntegration } from ${JSON.stringify(pathToFileURL(suite).href)};
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+let watched;
+const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'blitz-failed-child-'));
+try {
+  if (process.env.SECURE_GATE_MODE === 'failed') {
+    const testFile = path.join(scratch, 'fail.test.mjs');
+    await fs.writeFile(testFile, "import test from 'node:test';\\nimport assert from 'node:assert/strict';\\ntest('nope', () => { assert.equal(1, 2); });\\n");
+    watched = await runRecordedIntegration(testFile);
+  } else {
+    watched = await runSignalKilledIntegration();
+  }
+} finally {
+  await fs.rm(scratch, { recursive: true, force: true });
+}
+const failure = integrationFailure({ ...watched, execCode: 0, execSignal: null });
+if (!failure) {
+  console.error('integration child was treated as success');
+  process.exit(0);
+}
+console.error(failure);
+process.exit(1);
+`);
+  await writeExecutable(path.join(bin, 'git'), `#!/bin/sh
+set -u
+case "$1" in
+  rev-parse) printf '%s\\n' "$BLITZ_APPROVED_COMMIT" ;;
+  status) ;;
+  *) echo "unexpected git: $*" >&2; exit 1 ;;
+esac
+`);
+  await writeExecutable(path.join(bin, 'gcloud'), `#!/bin/sh
+printf '%s\\n' False
+`);
+  await writeExecutable(path.join(bin, 'curl'), `#!/bin/sh
+echo 'curl refused in deploy gate test' >&2
+exit 1
+`);
+  await writeExecutable(path.join(bin, 'firebase'), `#!/bin/sh
+set -u
+printf '%s\\n' "$*" >> "$SECURE_GATE_FIREBASE_LOG"
+case " $* " in
+  *' deploy '*) printf '%s\\n' DEPLOY >> "$SECURE_GATE_FIREBASE_LOG"; exit 99 ;;
+esac
+cat "$SECURE_GATE_SITES"
+`);
+  await writeExecutable(path.join(bin, 'npm'), `#!/bin/sh
+set -u
+printf '%s\\n' "$*" >> "$SECURE_GATE_NPM_LOG"
+if [ "$1" = "run" ] && [ "$2" = "test:secure" ]; then
+  if [ "$SECURE_GATE_MODE" = "missing-chrome" ]; then
+    exec "$SECURE_GATE_NODE" "$SECURE_GATE_SUITE"
+  fi
+  exec "$SECURE_GATE_NODE" "$SECURE_GATE_KILL"
+fi
+exit 0
+`);
+  const env = cleanChildEnv({
+    BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES',
+    BLITZ_APPROVED_COMMIT: approved,
+    BLITZ_EXPECTED_DEMO_RELEASE: 'sites/x/channels/live/releases/1',
+    BLITZ_SECURE_CONFIG: config,
+    PATH: `${bin}:${process.env.PATH}`,
+    SECURE_GATE_MODE: mode,
+    SECURE_GATE_FIREBASE_LOG: firebaseLog,
+    SECURE_GATE_NPM_LOG: npmLog,
+    SECURE_GATE_SITES: sites,
+    SECURE_GATE_NODE: process.execPath,
+    SECURE_GATE_SUITE: suite,
+    SECURE_GATE_KILL: killed,
+  });
+  if (mode === 'missing-chrome') env.CHROME_PATH = '/no/such/chrome-for-secure-gate';
+  else delete env.CHROME_PATH;
+  try {
+    const result = spawnSync('bash', [path.join(root, 'scripts', 'deploy-secure-blitz.sh')], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 45000,
+      env,
+    });
+    const firebaseText = await readFile(firebaseLog, 'utf8');
+    const npmText = await readFile(npmLog, 'utf8');
+    return { result, firebaseText, npmText };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test('missing Chrome stops the deploy script before firebase deploy', { timeout: 60000 }, async () => {
+  const { result, firebaseText, npmText } = await deployStopsBeforeFirebase('missing-chrome');
+  assert.notEqual(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /STOP: test:secure failed/);
+  assert.match(result.stderr, /CHROME_PATH/);
+  assert.match(result.stderr, /Playwright chromium/);
+  assert.match(npmText, /test:secure/);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /STEP_C: deploying|firebase deploy --config/);
+  assert.doesNotMatch(firebaseText, /deploy/);
+});
+
+test('a killed integration child stops the deploy script before firebase deploy', { timeout: 60000 }, async () => {
+  const { result, firebaseText, npmText } = await deployStopsBeforeFirebase('killed');
+  assert.notEqual(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /STOP: test:secure failed/);
+  assert.match(result.stderr, /integration child exited 137/);
+  assert.match(npmText, /test:secure/);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /STEP_C: deploying|firebase deploy --config/);
+  assert.doesNotMatch(firebaseText, /deploy/);
+});
+
+test('a failed integration child stops the deploy script before firebase deploy', { timeout: 60000 }, async () => {
+  const { result, firebaseText, npmText } = await deployStopsBeforeFirebase('failed');
+  assert.notEqual(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stderr, /STOP: test:secure failed/);
+  assert.match(result.stderr, /fail 1/);
+  assert.match(result.stderr, /integration child exited 1/);
+  assert.match(npmText, /test:secure/);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /STEP_C: deploying|firebase deploy --config/);
+  assert.doesNotMatch(firebaseText, /deploy/);
 });
