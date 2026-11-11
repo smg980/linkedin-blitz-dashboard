@@ -1,5 +1,8 @@
+import { spawnSync } from 'node:child_process';
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import puppeteer from 'puppeteer-core';
 
@@ -8,25 +11,99 @@ const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleW
 const NAMES = ['Example Ada', 'Example Ben', 'Example Cy', 'Example Di'];
 const VIEWPORT = { width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 1 };
 
-function chromePath() {
-  const candidates = [
-    process.env.CHROME_PATH,
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-  ].filter(Boolean);
-  return candidates;
+const SYSTEM_CHROME = [
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/usr/local/bin/google-chrome',
+  '/usr/local/bin/chromium',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+];
+
+export const CHROME_REQUIRED = 'Google Chrome is required for the secure shell browser check. Set CHROME_PATH to a Chrome or Chromium binary, or install Playwright chromium (`npx playwright install chromium`).';
+const CHROME_PROBE_MS = 5000;
+
+function chromeBanner(candidate) {
+  const probe = spawnSync(candidate, ['--version'], {
+    encoding: 'utf8',
+    timeout: CHROME_PROBE_MS,
+    killSignal: 'SIGKILL',
+  });
+  if (!probe || probe.error || probe.status !== 0) return false;
+  const banner = `${probe.stdout || ''}\n${probe.stderr || ''}`;
+  return /(?:Google Chrome|Chromium)\b/.test(banner);
 }
 
-async function findChrome() {
-  for (const candidate of chromePath()) {
+async function playwrightChromiumCandidates() {
+  const roots = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH,
+    path.join(os.homedir(), '.cache', 'ms-playwright'),
+    path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright'),
+  ].filter(Boolean);
+  const suffixes = [
+    ['chrome-linux64', 'chrome'],
+    ['chrome-linux', 'chrome'],
+    ['chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'],
+    ['chrome-win', 'chrome.exe'],
+  ];
+  const found = [];
+  for (const root of roots) {
+    let entries = [];
     try {
-      await fs.access(candidate);
-      return candidate;
-    } catch { /* try the next browser */ }
+      entries = await fs.readdir(root);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!/^chromium[-_]/.test(entry)) continue;
+      for (const suffix of suffixes) found.push(path.join(root, entry, ...suffix));
+    }
   }
-  throw new Error('Google Chrome is required for the secure shell browser check');
+  return found;
+}
+
+export async function findChrome(options = {}) {
+  const explicit = Object.hasOwn(options, 'chromePath') ? options.chromePath : process.env.CHROME_PATH;
+  const candidates = explicit ? [explicit] : [...SYSTEM_CHROME, ...await playwrightChromiumCandidates()];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const info = await fs.stat(candidate);
+      if (!info.isFile()) {
+        if (explicit) break;
+        continue;
+      }
+      await fs.access(candidate, fsConstants.X_OK);
+    } catch {
+      continue;
+    }
+    // An executable file is not enough: /bin/false and /bin/true both pass
+    // that check. Accept only a Chrome or Chromium --version banner.
+    if (chromeBanner(candidate)) return candidate;
+    if (explicit) break;
+  }
+  throw new Error(CHROME_REQUIRED);
+}
+
+async function closeBrowser(browser) {
+  if (!browser) return;
+  const proc = typeof browser.process === 'function' ? browser.process() : null;
+  await Promise.race([
+    Promise.resolve().then(() => browser.close()).catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, 5000)),
+  ]);
+  if (proc && proc.exitCode == null) {
+    try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+}
+
+async function closeServer(server) {
+  if (!server) return;
+  if (typeof server.closeAllConnections === 'function') {
+    try { server.closeAllConnections(); } catch { /* already closing */ }
+  }
+  await new Promise((resolve) => server.close(() => resolve()));
 }
 
 function contentType(file) {
@@ -165,22 +242,26 @@ async function prepare(page, url, userAgent) {
   await page.waitForSelector('body[data-booted="yes"]', { timeout: 20000 });
 }
 
-export async function checkSecureShell({ shellDir, passphrase, artifactsDir, ownerEmail, intruderEmail }) {
-  const server = await serve(shellDir);
-  const browser = await puppeteer.launch({
-    executablePath: await findChrome(),
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-popup-blocking',
-      '--disable-gpu',
-      '--disable-features=ThirdPartyStoragePartitioning,TrackingProtection3pcd,BlockThirdPartyCookies',
-    ],
-  });
-  const firestoreRequests = [];
-  const states = [];
+export async function checkSecureShell(options) {
+  const { shellDir, passphrase, artifactsDir, ownerEmail, intruderEmail } = options;
+  const executablePath = await findChrome(Object.hasOwn(options, 'chromePath') ? { chromePath: options.chromePath } : {});
+  let server;
+  let browser;
   try {
+    server = await serve(shellDir);
+    browser = await puppeteer.launch({
+      executablePath,
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-popup-blocking',
+        '--disable-gpu',
+        '--disable-features=ThirdPartyStoragePartitioning,TrackingProtection3pcd,BlockThirdPartyCookies',
+      ],
+    });
+    const firestoreRequests = [];
+    const states = [];
     const address = server.address();
     const url = `http://127.0.0.1:${address.port}/`;
     const page = await browser.newPage();
@@ -306,7 +387,7 @@ export async function checkSecureShell({ shellDir, passphrase, artifactsDir, own
     await redirect.close();
     return { states };
   } finally {
-    await browser.close();
-    await new Promise((resolve) => server.close(resolve));
+    await closeBrowser(browser);
+    await closeServer(server);
   }
 }

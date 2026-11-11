@@ -19,6 +19,14 @@ assert.ok(firestoreHost && authHost, 'Auth and Firestore emulator hosts are requ
 assertEmulatorTarget({ host: firestoreHost, projectId: PROJECT });
 if (!/^(127\.0\.0\.1|localhost):\d+$/.test(authHost)) throw new Error('Auth emulator host is not loopback');
 
+// A leaked server or browser must not keep this process alive. The timer does
+// not delay a finished run, and it ends a hung one.
+const overall = setTimeout(() => {
+  console.error('STOP: secure integration exceeded the overall timeout');
+  process.exit(1);
+}, 8 * 60 * 1000);
+overall.unref();
+
 const users = {};
 
 function cleanEnv(extra = {}) {
@@ -143,7 +151,7 @@ describe('private shell emulators', { concurrency: false }, () => {
     assert.equal(response.status, 403);
   });
 
-  test('built shell states fit an iPhone viewport', async () => {
+  test('built shell states fit an iPhone viewport', { timeout: 180000 }, async () => {
     const result = await checkSecureShell({
       shellDir: path.join(root, '.firebase-blitz-private-shell'),
       passphrase: DEMO_PASSPHRASE,
