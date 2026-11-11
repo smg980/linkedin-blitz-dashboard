@@ -20,6 +20,7 @@ test('iPhone breakpoints keep Lock visible and shrink nested grids without horiz
   assert.match(mobile, /\.stats\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/);
   assert.match(mobile, /\.sched-items,\.cards,\.c-card,\.doc-card\{grid-template-columns:minmax\(0,1fr\);min-width:0/);
   assert.match(mobile, /\.d-grid\{grid-template-columns:minmax\(0,1fr\);min-width:0/);
+  assert.match(mobile, /\.draft-head h3\{flex:1 0 100%;overflow-wrap:break-word\}/);
   assert.match(mobile, /\.table-wrap\{max-width:100%;overflow-x:auto/);
   assert.doesNotMatch(mobile, /(?:html|body)\s*\{[^}]*overflow-x:\s*hidden/,
     'Do not suppress page overflow to mask broken layout');
@@ -32,4 +33,6 @@ test('Blitz mobile polish preserves accessible navigation, noindex and encrypted
   assert.match(html, /id="example-banner"/);
   assert.match(html, /noindex, nofollow, noarchive/);
   assert.doesNotMatch(mobile, /data\.enc\.json|DASHBOARD_PASSPHRASE|firebase deploy/);
+  assert.match(blitz, /div\.draft\{/);
+  assert.doesNotMatch(blitz, /(^|[\n}])\.draft\{/, 'Draft card chrome must not restyle status badges that also use the draft class');
 });

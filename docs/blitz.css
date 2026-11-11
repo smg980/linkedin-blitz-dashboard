@@ -31,7 +31,7 @@ a.c-card:hover{border-color:var(--interactive)}
 .acct-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .counts{display:flex;gap:6px;flex-wrap:wrap}
 /* drafts */
-.draft{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--card-2);margin:0 0 12px}
+div.draft{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--card-2);margin:0 0 12px}
 .draft-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 .draft-head h3{margin:0;font-size:15px;flex:1}
 .draft .chars{font-size:12px;color:var(--muted)}
@@ -104,6 +104,7 @@ a.doc-card:hover{border-color:var(--interactive)}
   .d-hero h1{font-size:21px}
   .d-sec{padding:14px}
   .d-body,.draft blockquote,.q-text{overflow-wrap:anywhere}
+  .draft-head h3{flex:1 0 100%;overflow-wrap:break-word}
   .needs li{grid-template-columns:28px minmax(0,1fr);gap:10px}
   .table-wrap{max-width:100%;overflow-x:auto;overscroll-behavior-inline:contain}
   .foot{padding:6px 12px 28px}
