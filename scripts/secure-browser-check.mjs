@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
@@ -21,6 +22,18 @@ const SYSTEM_CHROME = [
 ];
 
 export const CHROME_REQUIRED = 'Google Chrome is required for the secure shell browser check. Set CHROME_PATH to a Chrome or Chromium binary, or install Playwright chromium (`npx playwright install chromium`).';
+const CHROME_PROBE_MS = 5000;
+
+function chromeBanner(candidate) {
+  const probe = spawnSync(candidate, ['--version'], {
+    encoding: 'utf8',
+    timeout: CHROME_PROBE_MS,
+    killSignal: 'SIGKILL',
+  });
+  if (!probe || probe.error || probe.status !== 0) return false;
+  const banner = `${probe.stdout || ''}\n${probe.stderr || ''}`;
+  return /(?:Google Chrome|Chromium)\b/.test(banner);
+}
 
 async function playwrightChromiumCandidates() {
   const roots = [
@@ -57,10 +70,18 @@ export async function findChrome(options = {}) {
     if (!candidate) continue;
     try {
       const info = await fs.stat(candidate);
-      if (!info.isFile()) continue;
+      if (!info.isFile()) {
+        if (explicit) break;
+        continue;
+      }
       await fs.access(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch { /* try the next browser */ }
+    } catch {
+      continue;
+    }
+    // An executable file is not enough: /bin/false and /bin/true both pass
+    // that check. Accept only a Chrome or Chromium --version banner.
+    if (chromeBanner(candidate)) return candidate;
+    if (explicit) break;
   }
   throw new Error(CHROME_REQUIRED);
 }

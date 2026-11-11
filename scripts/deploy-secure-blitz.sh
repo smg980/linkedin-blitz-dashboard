@@ -33,6 +33,19 @@ previous_version_id=""
 captured=""
 
 stop() { echo "STOP: $*" >&2; exit 1; }
+require_suite_attestation() {
+  [[ -n "${BLITZ_SECURE_ATTEST_NONCE:-}" && -n "${BLITZ_SECURE_ATTEST_PATH:-}" ]] || return 1
+  [[ "$BLITZ_SECURE_ATTEST_NONCE" =~ ^[0-9a-f]{32}$ ]] || return 1
+  [[ -f "$BLITZ_SECURE_ATTEST_PATH" ]] || return 1
+  grep -F -x -q -- "nonce=${BLITZ_SECURE_ATTEST_NONCE}" "$BLITZ_SECURE_ATTEST_PATH" || return 1
+  grep -F -x -q -- 'tests=7' "$BLITZ_SECURE_ATTEST_PATH" || return 1
+  grep -F -x -q -- 'pass=7' "$BLITZ_SECURE_ATTEST_PATH" || return 1
+  grep -F -x -q -- 'fail=0' "$BLITZ_SECURE_ATTEST_PATH" || return 1
+  grep -F -x -q -- 'cancelled=0' "$BLITZ_SECURE_ATTEST_PATH" || return 1
+  grep -F -x -q -- 'skipped=0' "$BLITZ_SECURE_ATTEST_PATH" || return 1
+  grep -F -x -q -- 'todo=0' "$BLITZ_SECURE_ATTEST_PATH" || return 1
+  grep -F -x -q -- 'iphone=pass' "$BLITZ_SECURE_ATTEST_PATH" || return 1
+}
 require_billing_off() {
   local state
   state="$(gcloud billing projects describe "$PROJECT" --format='value(billingEnabled)')" || stop "$1"
@@ -81,10 +94,16 @@ env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
     npm run verify:bundle || stop 'verify:bundle failed.'
+BLITZ_SECURE_ATTEST_NONCE="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" || stop 'Cannot create the secure suite attestation.'
+[[ "$BLITZ_SECURE_ATTEST_NONCE" =~ ^[0-9a-f]{32}$ ]] || stop 'Cannot create the secure suite attestation.'
+BLITZ_SECURE_ATTEST_PATH="$(mktemp)" || stop 'Cannot create the secure suite attestation.'
+rm -f "$BLITZ_SECURE_ATTEST_PATH"
+export BLITZ_SECURE_ATTEST_NONCE BLITZ_SECURE_ATTEST_PATH
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
     npm run test:secure || stop 'test:secure failed.'
+require_suite_attestation || stop 'Secure suite attestation is missing or does not match this run.'
 node scripts/build-secure-shell.mjs --config "${BLITZ_SECURE_CONFIG:-secure-config.local.json}" || stop 'Secure shell build failed.'
 node scripts/secure-hosting-guard.mjs --assert-shell || stop 'Secure shell output check failed.'
 [[ -z "$(git status --porcelain)" ]] || stop 'Build modified tracked files.'
@@ -153,6 +172,7 @@ verify_demo_sha || stop 'Cannot verify existing fictional demo.'
 require_billing_off 'Billing changed before deploy.' || stop 'Billing changed before deploy.'
 capture_live || stop 'Could not re-read the live Hosting release.'
 [[ "$captured" == "$previous" ]] || stop 'Concurrent Hosting change detected.'
+require_suite_attestation || stop 'Secure suite attestation is missing or does not match this run.'
 
 rollback_command="firebase hosting:clone --project ${PROJECT} --non-interactive ${SITE}@${previous_version_id} ${SITE}:live"
 echo "STEP_C_LIVE_RELEASE=${previous_release}"

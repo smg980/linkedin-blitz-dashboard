@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -214,6 +214,10 @@ test('secure deploy script can target only hosting:blitz and prints an exact clo
   assert.equal([...scriptCode.matchAll(/secure-hosting-guard\.mjs --assert-config \|\| stop 'Private Hosting config check failed\.'/g)].length, 2);
   assert.equal([...scriptCode.matchAll(/secure-hosting-guard\.mjs --assert-shell \|\| stop 'Secure shell output check failed\.'/g)].length, 2);
   assert.match(scriptCode, /build-secure-shell\.mjs --config "\$\{BLITZ_SECURE_CONFIG:-secure-config\.local\.json\}" \|\| stop 'Secure shell build failed\.'/);
+  const deployAt = scriptCode.indexOf('firebase deploy --config firebase.secure-blitz.json --only "hosting:$TARGET" --project "$PROJECT" --non-interactive');
+  const attestCalls = [...scriptCode.matchAll(/require_suite_attestation \|\| stop 'Secure suite attestation is missing or does not match this run\.'/g)];
+  assert.equal(attestCalls.length, 2);
+  assert.ok(attestCalls.every((match) => match.index < deployAt));
 });
 
 function assertDeployRefusals(base) {
@@ -261,7 +265,15 @@ async function writeExecutable(file, body) {
   await chmod(file, 0o755);
 }
 
-async function deployStopsBeforeFirebase(mode) {
+function processIdentity(pid) {
+  const ps = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'pid=,ppid=,pgid=,stat=,args='], { encoding: 'utf8' });
+  if (ps.status !== 0) return null;
+  const match = ps.stdout.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+([\s\S]*)$/);
+  if (!match || match[4].startsWith('Z')) return null;
+  return { pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), args: match[5] };
+}
+
+async function deployStopsBeforeFirebase(mode, { signal = '' } = {}) {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const dir = await mkdtemp(path.join(os.tmpdir(), 'blitz-deploy-gate-'));
   const bin = path.join(dir, 'bin');
@@ -287,32 +299,74 @@ async function deployStopsBeforeFirebase(mode) {
     },
   }));
   const suite = path.join(root, 'scripts', 'run-secure-suite.mjs');
-  await writeFile(killed, `import { integrationFailure, runRecordedIntegration, runSignalKilledIntegration } from ${JSON.stringify(pathToFileURL(suite).href)};
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
-
-let watched;
-const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'blitz-failed-child-'));
-try {
-  if (process.env.SECURE_GATE_MODE === 'failed') {
-    const testFile = path.join(scratch, 'fail.test.mjs');
-    await fs.writeFile(testFile, "import test from 'node:test';\\nimport assert from 'node:assert/strict';\\ntest('nope', () => { assert.equal(1, 2); });\\n");
-    watched = await runRecordedIntegration(testFile);
-  } else {
-    watched = await runSignalKilledIntegration();
-  }
-} finally {
-  await fs.rm(scratch, { recursive: true, force: true });
-}
-const failure = integrationFailure({ ...watched, execCode: 0, execSignal: null });
-if (!failure) {
-  console.error('integration child was treated as success');
-  process.exit(0);
-}
-console.error(failure);
-process.exit(1);
-`);
+  const pidFile = path.join(dir, 'pids');
+  const marker = path.join(dir, 'cloud-firestore-emulator.mjs');
+  const cli = path.join(dir, 'fake-cli');
+  const cliBodies = {
+    'partial-skip': "#!/bin/sh\nprintf '%s\\n' 'ℹ tests 7' 'ℹ pass 6' 'ℹ fail 0' 'ℹ cancelled 0' 'ℹ skipped 1' 'ℹ todo 0'\nexit 0\n",
+    'partial-none': "#!/bin/sh\nprintf '%s\\n' '✔ Script exited successfully (code 0)'\nexit 0\n",
+    'partial-one': "#!/bin/sh\nprintf '%s\\n' 'ℹ tests 1' 'ℹ pass 1' 'ℹ fail 0' 'ℹ cancelled 0' 'ℹ skipped 0' 'ℹ todo 0' '✔ built shell states fit an iPhone viewport'\nexit 0\n",
+    'partial-six': "#!/bin/sh\nprintf '%s\\n' 'ℹ tests 6' 'ℹ pass 6' 'ℹ fail 0' 'ℹ cancelled 0' 'ℹ skipped 0' 'ℹ todo 0' '✔ built shell states fit an iPhone viewport'\nexit 0\n",
+    'partial-duplicate': "#!/bin/sh\nprintf '%s\\n' 'ℹ tests 7' 'ℹ pass 7' 'ℹ fail 0' 'ℹ cancelled 0' 'ℹ skipped 0' 'ℹ todo 0' '✔ built shell states fit an iPhone viewport' 'ℹ tests 7' 'ℹ pass 7' 'ℹ fail 0' 'ℹ cancelled 0' 'ℹ skipped 0' 'ℹ todo 0' '✔ built shell states fit an iPhone viewport'\nexit 0\n",
+  };
+  await writeFile(pidFile, '');
+  await writeFile(marker, 'setInterval(() => {}, 1000);\n');
+  await writeExecutable(cli, cliBodies[mode] || '#!/bin/sh\nexit 0\n');
+  await writeFile(killed, [
+    "import { spawnSync } from 'node:child_process';",
+    `import { integrationFailure, runProcessDrill, runRecordedIntegration, runSignalKilledIntegration } from ${JSON.stringify(pathToFileURL(suite).href)};`,
+    "import fs from 'node:fs/promises';",
+    "import os from 'node:os';",
+    "import path from 'node:path';",
+    '',
+    'const mode = process.env.SECURE_GATE_MODE;',
+    "if (mode === 'timeout' || mode === 'sigterm' || mode === 'sigint') {",
+    '  await runProcessDrill({',
+    "    mode: mode === 'timeout' ? 'timeout' : 'signal',",
+    '    pidFile: process.env.SECURE_GATE_PIDS,',
+    '    marker: process.env.SECURE_GATE_MARKER,',
+    '  });',
+    '}',
+    "if (String(mode).startsWith('partial-')) {",
+    "  const cli = spawnSync(process.env.SECURE_GATE_CLI, { encoding: 'utf8' });",
+    '  const failure = integrationFailure({',
+    '    execCode: cli.status,',
+    '    execSignal: cli.signal,',
+    "    output: `${cli.stdout || ''}\\n${cli.stderr || ''}`,",
+    '    childStatus: 0,',
+    '  });',
+    '  if (!failure) {',
+    "    console.error('PARTIAL_TREATED_AS_SUCCESS');",
+    '    process.exit(0);',
+    '  }',
+    '  console.error(failure);',
+    '  process.exit(1);',
+    '}',
+    'let watched;',
+    "const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'blitz-failed-child-'));",
+    'try {',
+    '  const testFile = path.join(scratch, \'fail.test.mjs\');',
+    "  if (mode === 'failed') {",
+    '    await fs.writeFile(testFile, "import test from \'node:test\';\\nimport assert from \'node:assert/strict\';\\ntest(\'nope\', () => { assert.equal(1, 2); });\\n");',
+    '    watched = await runRecordedIntegration(testFile);',
+    "  } else if (mode === 'iphone') {",
+    '    await fs.writeFile(testFile, "import test from \'node:test\';\\nimport assert from \'node:assert/strict\';\\ntest(\'built shell states fit an iPhone viewport\', () => { assert.equal(1, 2); });\\n");',
+    '    watched = await runRecordedIntegration(testFile);',
+    '  } else {',
+    '    watched = await runSignalKilledIntegration();',
+    '  }',
+    '} finally {',
+    '  await fs.rm(scratch, { recursive: true, force: true });',
+    '}',
+    'const failure = integrationFailure({ ...watched, execCode: 0, execSignal: null });',
+    'if (!failure) {',
+    "  console.error('integration child was treated as success');",
+    '  process.exit(0);',
+    '}',
+    'console.error(failure);',
+    'process.exit(1);',
+    '',
+  ].join('\n'));
   await writeExecutable(path.join(bin, 'git'), `#!/bin/sh
 set -u
 case "$1" in
@@ -339,11 +393,21 @@ cat "$SECURE_GATE_SITES"
   await writeExecutable(path.join(bin, 'npm'), `#!/bin/sh
 set -u
 printf '%s\\n' "$*" >> "$SECURE_GATE_NPM_LOG"
+if [ -n "\${BLITZ_APPROVE_SECURE_SHELL_DEPLOY:-}" ] || [ -n "\${BLITZ_APPROVED_COMMIT:-}" ] || [ -n "\${BLITZ_EXPECTED_DEMO_RELEASE:-}" ]; then
+  printf '%s\\n' APPROVAL_VARS_PRESENT >> "$SECURE_GATE_NPM_LOG"
+fi
 if [ "$1" = "run" ] && [ "$2" = "test:secure" ]; then
-  if [ "$SECURE_GATE_MODE" = "missing-chrome" ]; then
-    exec "$SECURE_GATE_NODE" "$SECURE_GATE_SUITE"
-  fi
-  exec "$SECURE_GATE_NODE" "$SECURE_GATE_KILL"
+  case "$SECURE_GATE_MODE" in
+    missing-chrome|false-chrome|true-chrome|echo-chrome)
+      exec "$SECURE_GATE_NODE" "$SECURE_GATE_SUITE" ;;
+    no-attest)
+      exit 0 ;;
+    bad-attest)
+      printf '%s\\n' 'nonce=00000000000000000000000000000000' 'tests=7' 'pass=7' 'fail=0' 'cancelled=0' 'skipped=0' 'todo=0' 'iphone=pass' > "$BLITZ_SECURE_ATTEST_PATH"
+      exit 0 ;;
+    *)
+      exec "$SECURE_GATE_NODE" "$SECURE_GATE_KILL" ;;
+  esac
 fi
 exit 0
 `);
@@ -360,20 +424,74 @@ exit 0
     SECURE_GATE_NODE: process.execPath,
     SECURE_GATE_SUITE: suite,
     SECURE_GATE_KILL: killed,
+    SECURE_GATE_PIDS: pidFile,
+    SECURE_GATE_MARKER: marker,
+    SECURE_GATE_CLI: cli,
   });
   if (mode === 'missing-chrome') env.CHROME_PATH = '/no/such/chrome-for-secure-gate';
+  else if (mode === 'false-chrome') env.CHROME_PATH = '/bin/false';
+  else if (mode === 'true-chrome') env.CHROME_PATH = '/bin/true';
+  else if (mode === 'echo-chrome') env.CHROME_PATH = '/bin/echo';
   else delete env.CHROME_PATH;
+  const scriptPath = path.join(root, 'scripts', 'deploy-secure-blitz.sh');
   try {
-    const result = spawnSync('bash', [path.join(root, 'scripts', 'deploy-secure-blitz.sh')], {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: 45000,
-      env,
-    });
+    let result;
+    let drillText = '';
+    if (!signal) {
+      result = spawnSync('bash', [scriptPath], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 45000,
+        env,
+      });
+    } else {
+      const child = spawn('bash', [scriptPath], { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (buf) => { stdout += buf; });
+      child.stderr.on('data', (buf) => { stderr += buf; });
+      const exited = new Promise((resolve) => child.once('exit', (code) => resolve(code)));
+      const deadline = Date.now() + 20000;
+      let text = '';
+      while (Date.now() < deadline) {
+        text = await readFile(pidFile, 'utf8').catch(() => '');
+        if (text.includes('ready\n')) break;
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      if (!text.includes('ready\n')) {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        throw new Error(`runner did not become ready\n${stderr}\n${text}`);
+      }
+      const runner = Number(text.match(/^runner=(\d+)$/m)[1]);
+      const helper = Number(text.match(/^helper=(\d+)$/m)[1]);
+      const grand = Number(text.match(/^grand=(\d+)$/m)[1]);
+      const grandInfo = processIdentity(grand);
+      const helperInfo = processIdentity(helper);
+      assert.ok(grandInfo && helperInfo, text);
+      assert.equal(grandInfo.ppid, helper);
+      assert.notEqual(grandInfo.pgid, helperInfo.pgid);
+      assert.match(grandInfo.args, /cloud-firestore-emulator/);
+      process.kill(runner, signal);
+      const code = await Promise.race([
+        exited,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`deploy script hung after ${signal}\n${stderr}`)), 15000)),
+      ]);
+      result = { status: code, stdout, stderr };
+    }
     const firebaseText = await readFile(firebaseLog, 'utf8');
     const npmText = await readFile(npmLog, 'utf8');
-    return { result, firebaseText, npmText };
+    drillText = await readFile(pidFile, 'utf8').catch(() => '');
+    const descendants = [...drillText.matchAll(/^(?:helper|grand)=(\d+)$/gm)].map((match) => ({
+      pid: Number(match[1]),
+      live: processIdentity(Number(match[1])),
+    }));
+    assert.doesNotMatch(npmText, /APPROVAL_VARS_PRESENT/);
+    return { result, firebaseText, npmText, drillText, descendants };
   } finally {
+    const text = await readFile(pidFile, 'utf8').catch(() => '');
+    for (const match of text.matchAll(/^(?:runner|helper|grand)=(\d+)$/gm)) {
+      try { process.kill(Number(match[1]), 'SIGKILL'); } catch { /* already gone */ }
+    }
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -408,4 +526,75 @@ test('a failed integration child stops the deploy script before firebase deploy'
   assert.match(npmText, /test:secure/);
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /STEP_C: deploying|firebase deploy --config/);
   assert.doesNotMatch(firebaseText, /deploy/);
+});
+
+function assertDeployBlocked(outcome, pattern) {
+  const combined = `${outcome.result.stdout}\n${outcome.result.stderr}`;
+  assert.notEqual(outcome.result.status, 0, combined);
+  assert.match(combined, pattern);
+  assert.doesNotMatch(combined, /STEP_C: deploying|firebase deploy --config|PARTIAL_TREATED_AS_SUCCESS/);
+  assert.doesNotMatch(outcome.firebaseText, /deploy/);
+  assert.doesNotMatch(outcome.npmText, /APPROVAL_VARS_PRESENT/);
+  assert.match(outcome.npmText, /test:secure/);
+}
+
+test('/bin/false as Chrome stops the deploy script before emulators and firebase deploy', { timeout: 60000 }, async () => {
+  const outcome = await deployStopsBeforeFirebase('false-chrome');
+  assertDeployBlocked(outcome, /CHROME_PATH/);
+  assert.match(outcome.result.stderr, /Playwright chromium/);
+  assert.doesNotMatch(`${outcome.result.stdout}\n${outcome.result.stderr}`, /emulators: Starting|Running script|All emulators ready/);
+});
+
+test('/bin/true and a non-Chrome binary stop the deploy script before firebase deploy', { timeout: 60000 }, async () => {
+  for (const mode of ['true-chrome', 'echo-chrome']) {
+    const outcome = await deployStopsBeforeFirebase(mode);
+    assertDeployBlocked(outcome, /CHROME_PATH/);
+    assert.doesNotMatch(`${outcome.result.stdout}\n${outcome.result.stderr}`, /emulators: Starting|Running script|All emulators ready/);
+  }
+});
+
+test('a forced iPhone viewport failure stops the deploy script before firebase deploy', { timeout: 60000 }, async () => {
+  const outcome = await deployStopsBeforeFirebase('iphone');
+  assertDeployBlocked(outcome, /built shell states fit an iPhone viewport/);
+  assert.match(`${outcome.result.stdout}\n${outcome.result.stderr}`, /fail 1/);
+});
+
+test('a fake CLI that exits 0 with a partial summary never reaches firebase deploy', { timeout: 60000 }, async () => {
+  const skipped = await deployStopsBeforeFirebase('partial-skip');
+  assertDeployBlocked(skipped, /integration summary requires/);
+  assert.match(skipped.result.stderr, /skipped 1|pass 7/);
+  const missing = await deployStopsBeforeFirebase('partial-none');
+  assertDeployBlocked(missing, /integration summary requires/);
+  const one = await deployStopsBeforeFirebase('partial-one');
+  assertDeployBlocked(one, /requires tests 7/);
+  const six = await deployStopsBeforeFirebase('partial-six');
+  assertDeployBlocked(six, /requires tests 7/);
+  const duplicate = await deployStopsBeforeFirebase('partial-duplicate');
+  assertDeployBlocked(duplicate, /duplicate/);
+});
+
+test('a zero exit without a matching attestation never reaches firebase deploy', { timeout: 60000 }, async () => {
+  const missing = await deployStopsBeforeFirebase('no-attest');
+  assertDeployBlocked(missing, /Secure suite attestation is missing or does not match this run/);
+  const mismatched = await deployStopsBeforeFirebase('bad-attest');
+  assertDeployBlocked(mismatched, /Secure suite attestation is missing or does not match this run/);
+});
+
+test('a watchdog timeout kills the detached grandchild and never reaches firebase deploy', { timeout: 60000 }, async () => {
+  const outcome = await deployStopsBeforeFirebase('timeout');
+  assertDeployBlocked(outcome, /secure suite timed out/);
+  assert.ok(outcome.descendants.length >= 2, outcome.drillText);
+  assert.ok(outcome.descendants.every((entry) => entry.live == null), JSON.stringify(outcome.descendants));
+  assert.match(outcome.drillText, /cloud-firestore-emulator|grand=/);
+  assert.notEqual(outcome.drillText.match(/^grandpgid=(\d+)$/m)[1], outcome.drillText.match(/^helperpgid=(\d+)$/m)[1]);
+});
+
+test('SIGTERM and SIGINT to the runner leave no descendants and never reach firebase deploy', { timeout: 60000 }, async () => {
+  for (const [mode, signal, code] of [['sigterm', 'SIGTERM', 143], ['sigint', 'SIGINT', 130]]) {
+    const outcome = await deployStopsBeforeFirebase(mode, { signal });
+    assertDeployBlocked(outcome, /STOP: test:secure failed/);
+    assert.match(outcome.drillText, new RegExp(`signal=${signal}`));
+    assert.match(outcome.drillText, new RegExp(`code=${code}`));
+    assert.ok(outcome.descendants.every((entry) => entry.live == null), JSON.stringify(outcome.descendants));
+  }
 });

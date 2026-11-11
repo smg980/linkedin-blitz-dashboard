@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { isPopupUnavailable, shouldUseRedirectFirst } from '../secure/auth-flow.mjs';
 import { assertEmulatorTarget } from '../secure/emulator-guard.mjs';
@@ -14,7 +14,7 @@ import { syntheticPayload } from '../secure/synthetic-contacts.mjs';
 import { wipePrivateRoot } from '../secure/wipe.mjs';
 import { buildSecureShell } from '../scripts/build-secure-shell.mjs';
 import { CHROME_REQUIRED, checkSecureShell, findChrome } from '../scripts/secure-browser-check.mjs';
-import { integrationFailure, launcherSource, runRecordedIntegration, runSignalKilledIntegration } from '../scripts/run-secure-suite.mjs';
+import { finalizeSuiteResult, integrationFailure, launcherSource, prepareAttestation, runRecordedIntegration, runSignalKilledIntegration, SUITE_TIMEOUT_MS } from '../scripts/run-secure-suite.mjs';
 import { FORBIDDEN_SNIPPETS, SECURE_OUT, SECURE_SHELL_FILES, verifySecureShell } from '../scripts/verify-secure-shell.mjs';
 import { productionCsp } from '../secure/csp.mjs';
 
@@ -292,10 +292,16 @@ test('missing Chrome makes test:secure exit nonzero before emulators start', { t
 });
 
 test('a killed or failed integration child fails the suite even when emulators:exec exits 0', { timeout: 30000 }, async () => {
-  assert.equal(integrationFailure({
+  assert.match(integrationFailure({
     execCode: 0,
     execSignal: null,
     output: 'ℹ tests 7\nℹ pass 7\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\n✔ Script exited successfully (code 0)\n',
+    childStatus: 0,
+  }), /one passing iPhone viewport test/);
+  assert.equal(integrationFailure({
+    execCode: 0,
+    execSignal: null,
+    output: '  ✔ built shell states fit an iPhone viewport (7109.273807ms)\nℹ tests 7\nℹ pass 7\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\n✔ Script exited successfully (code 0)\n',
     childStatus: 0,
   }), null);
   assert.match(integrationFailure({
@@ -334,11 +340,22 @@ test('a killed or failed integration child fails the suite even when emulators:e
 });
 
 
-test('secure integration rejects incomplete, missing, skipped, cancelled, and duplicated summaries', () => {
+test('secure integration rejects incomplete, missing, skipped, cancelled, duplicated, and non-iPhone summaries', () => {
   const base = { execCode: 0, execSignal: null, childStatus: 0 };
   const summary = ({ tests = 7, pass = 7, fail = 0, cancelled = 0, skipped = 0, todo = 0 } = {}) =>
-    `ℹ tests ${tests}\nℹ pass ${pass}\nℹ fail ${fail}\nℹ cancelled ${cancelled}\nℹ skipped ${skipped}\nℹ todo ${todo}\n✔ Script exited successfully (code 0)\n`;
+    `ℹ tests ${tests}\nℹ pass ${pass}\nℹ fail ${fail}\nℹ cancelled ${cancelled}\nℹ skipped ${skipped}\nℹ todo ${todo}\n✔ built shell states fit an iPhone viewport (1ms)\n✔ Script exited successfully (code 0)\n`;
   assert.equal(integrationFailure({ ...base, output: summary() }), null);
+  const padded = ['tests 7', 'pass 7', 'fail 0', 'cancelled 0', 'skipped 0', 'todo 0']
+    .map((item) => `${' '.repeat(120)}ℹ ${item}`)
+    .join('\n');
+  assert.equal(integrationFailure({
+    ...base,
+    output: `${padded}\n${' '.repeat(120)}✔ built shell states fit an iPhone viewport (9ms)\n`,
+  }), null);
+  assert.equal(integrationFailure({
+    ...base,
+    output: '\u001b[32m✔\u001b[39m built shell states fit an iPhone viewport \u001b[90m(7109.273807ms)\u001b[39m\n\u001b[34mℹ\u001b[39m tests 7\nℹ pass 7\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\n',
+  }), null);
   for (const incomplete of [
     summary({ tests: 0, pass: 0 }),
     summary({ tests: 1, pass: 1 }),
@@ -349,8 +366,209 @@ test('secure integration rejects incomplete, missing, skipped, cancelled, and du
     summary({ tests: 7, pass: 6, todo: 1 }),
     '✔ Script exited successfully (code 0)\n',
     'ℹ tests 7\nℹ pass 7\nℹ fail 0\n',
+    summary().replace('✔ built shell states fit an iPhone viewport (1ms)\n', ''),
     summary() + summary(),
   ]) {
     assert.match(integrationFailure({ ...base, output: incomplete }), /integration summary (requires|has duplicate)/);
+  }
+});
+
+function processIdentity(pid) {
+  const ps = spawnSync('ps', ['-ww', '-p', String(pid), '-o', 'pid=,ppid=,pgid=,stat=,args='], { encoding: 'utf8' });
+  if (ps.status !== 0) return null;
+  const line = ps.stdout.trim();
+  const match = line.match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+([\s\S]*)$/);
+  if (!match || match[4].startsWith('Z')) return null;
+  return { pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), args: match[5] };
+}
+
+async function withDrill(fn) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'blitz-drill-'));
+  const marker = path.join(dir, 'cloud-firestore-emulator.mjs');
+  const pidFile = path.join(dir, 'pids');
+  const drill = path.join(dir, 'drill.mjs');
+  await fs.writeFile(marker, 'setInterval(() => {}, 1000);\n');
+  await fs.writeFile(pidFile, '');
+  await fs.writeFile(drill, `import { runProcessDrill } from ${JSON.stringify(pathToFileURL(path.join(root, 'scripts', 'run-secure-suite.mjs')).href)};
+await runProcessDrill({
+  mode: process.argv[2],
+  pidFile: process.argv[3],
+  marker: process.argv[4],
+  timeoutMs: 800,
+});
+`);
+  try {
+    return await fn({ dir, marker, pidFile, drill });
+  } finally {
+    const text = await fs.readFile(pidFile, 'utf8').catch(() => '');
+    for (const match of text.matchAll(/^(?:runner|helper|grand)=(\d+)$/gm)) {
+      try { process.kill(Number(match[1]), 'SIGKILL'); } catch { /* already gone */ }
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+test('Chrome preflight accepts only a Chrome or Chromium version banner', async () => {
+  for (const bin of ['/bin/false', '/bin/true', '/bin/echo']) {
+    await assert.rejects(findChrome({ chromePath: bin }), /CHROME_PATH/);
+    await assert.rejects(findChrome({ chromePath: bin }), /Playwright chromium/);
+  }
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'blitz-chrome-'));
+  try {
+    const bins = {
+      accept: '#!/bin/sh\necho "Google Chrome 1.2.3"\n',
+      chromium: '#!/bin/sh\necho "Chromium 120.0.0"\n',
+      stderrChrome: '#!/bin/sh\necho "Google Chrome 9" >&2\n',
+      reject: '#!/bin/sh\necho "true (GNU coreutils) 9.4"\nexit 0\n',
+      fail: '#!/bin/sh\necho "Google Chrome 1"\nexit 1\n',
+      slow: '#!/bin/sh\nsleep 30\necho "Google Chrome 1"\n',
+    };
+    const paths = {};
+    for (const [name, body] of Object.entries(bins)) {
+      paths[name] = path.join(dir, name);
+      await fs.writeFile(paths[name], body, { mode: 0o755 });
+      await fs.chmod(paths[name], 0o755);
+    }
+    assert.equal(await findChrome({ chromePath: paths.accept }), paths.accept);
+    assert.equal(await findChrome({ chromePath: paths.chromium }), paths.chromium);
+    assert.equal(await findChrome({ chromePath: paths.stderrChrome }), paths.stderrChrome);
+    await assert.rejects(findChrome({ chromePath: paths.reject }), /CHROME_PATH/);
+    await assert.rejects(findChrome({ chromePath: paths.fail }), /CHROME_PATH/);
+    const started = Date.now();
+    await assert.rejects(findChrome({ chromePath: paths.slow }), /CHROME_PATH/);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 8000, `Chrome probe hung for ${elapsed}ms`);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('unusable Chrome binaries fail the suite before emulators start', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'blitz-chrome-suite-'));
+  const slow = path.join(dir, 'slow-chrome');
+  await fs.writeFile(slow, '#!/bin/sh\nsleep 30\necho "Google Chrome 1"\n', { mode: 0o755 });
+  await fs.chmod(slow, 0o755);
+  try {
+    for (const chromePath of ['/bin/false', '/bin/true', '/bin/echo', slow]) {
+      const result = spawnSync(process.execPath, [path.join(root, 'scripts', 'run-secure-suite.mjs')], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 15000,
+        env: { ...process.env, CHROME_PATH: chromePath },
+      });
+      const combined = `${result.stdout}\n${result.stderr}`;
+      assert.notEqual(result.status, 0, combined);
+      assert.match(combined, /CHROME_PATH/);
+      assert.match(combined, /Playwright chromium/);
+      assert.doesNotMatch(combined, /emulators: Starting|Running script|All emulators ready/);
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('attestation is deleted up front and written only after a seven-test iPhone pass', async () => {
+  assert.ok(SUITE_TIMEOUT_MS > 0 && SUITE_TIMEOUT_MS < 15 * 60 * 1000);
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'blitz-attest-'));
+  const attestPath = path.join(dir, 'attest');
+  const nonce = 'cd'.repeat(16);
+  const watched = (output, extra = {}) => ({ execCode: 0, execSignal: null, childStatus: 0, output, timedOut: false, survivors: [], ...extra });
+  const report = ({ tests = 7, pass = 7, fail = 0, cancelled = 0, skipped = 0, todo = 0, iphone = true } = {}) => {
+    const counts = [
+      `ℹ tests ${tests}`,
+      `ℹ pass ${pass}`,
+      `ℹ fail ${fail}`,
+      `ℹ cancelled ${cancelled}`,
+      `ℹ skipped ${skipped}`,
+      `ℹ todo ${todo}`,
+    ].join('\n');
+    return `${iphone ? '✔ built shell states fit an iPhone viewport (9ms)\n' : ''}${counts}\n`;
+  };
+  try {
+    await fs.writeFile(attestPath, 'nonce=stale\ntests=7\npass=7\nfail=0\ncancelled=0\nskipped=0\ntodo=0\niphone=pass\n');
+    const prepared = await prepareAttestation({ BLITZ_SECURE_ATTEST_NONCE: nonce, BLITZ_SECURE_ATTEST_PATH: attestPath });
+    await assert.rejects(() => fs.access(attestPath), 'stale attestation was reused');
+    for (const output of [
+      report({ tests: 1, pass: 1 }),
+      report({ tests: 6, pass: 6 }),
+      report({ tests: 7, pass: 6, skipped: 1, iphone: false }),
+      '✔ Script exited successfully (code 0)\n',
+      report() + report(),
+    ]) {
+      const failed = await finalizeSuiteResult(watched(output), prepared);
+      assert.notEqual(failed.exitCode, 0, output);
+      await assert.rejects(() => fs.access(attestPath));
+    }
+    const leaked = await finalizeSuiteResult(watched(report(), { survivors: [4242] }), prepared);
+    assert.equal(leaked.exitCode, 1);
+    assert.match(leaked.failure, /descendants still running/);
+    await assert.rejects(() => fs.access(attestPath));
+    const timed = await finalizeSuiteResult(watched(report(), { timedOut: true }), prepared);
+    assert.equal(timed.exitCode, 124);
+    await assert.rejects(() => fs.access(attestPath));
+    const good = await finalizeSuiteResult(watched(report()), prepared);
+    assert.deepEqual(good, { failure: null, exitCode: 0 });
+    const body = await fs.readFile(attestPath, 'utf8');
+    assert.match(body, new RegExp(`^nonce=${nonce}$`, 'm'));
+    assert.match(body, /^tests=7$/m);
+    assert.match(body, /^pass=7$/m);
+    assert.match(body, /^fail=0$/m);
+    assert.match(body, /^cancelled=0$/m);
+    assert.match(body, /^skipped=0$/m);
+    assert.match(body, /^todo=0$/m);
+    assert.match(body, /^iphone=pass$/m);
+    await prepareAttestation({ BLITZ_SECURE_ATTEST_NONCE: nonce, BLITZ_SECURE_ATTEST_PATH: attestPath });
+    await assert.rejects(() => fs.access(attestPath), 'a later invocation reused the previous attestation');
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a short watchdog kills a detached grandchild and exits 124', { timeout: 20000 }, async () => {
+  await withDrill(async ({ marker, pidFile, drill }) => {
+    const result = spawnSync(process.execPath, [drill, 'timeout', pidFile, marker], {
+      encoding: 'utf8',
+      timeout: 15000,
+    });
+    assert.equal(result.status, 124, `${result.stderr}\n${result.stdout}`);
+    assert.match(result.stderr, /secure suite timed out/);
+    const text = await fs.readFile(pidFile, 'utf8');
+    assert.match(text, /^grand=\d+$/m);
+    assert.notEqual(text.match(/^grandpgid=(\d+)$/m)[1], text.match(/^helperpgid=(\d+)$/m)[1]);
+    assert.equal(processIdentity(Number(text.match(/^grand=(\d+)$/m)[1])), null);
+    assert.equal(processIdentity(Number(text.match(/^helper=(\d+)$/m)[1])), null);
+    await assert.rejects(() => fs.access(path.join(path.dirname(pidFile), 'attest-must-not-be-written')));
+  });
+});
+
+test('SIGINT and SIGTERM reap a detached grandchild and exit 130 or 143', { timeout: 20000 }, async () => {
+  for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+    await withDrill(async ({ marker, pidFile, drill }) => {
+      const child = spawn(process.execPath, [drill, 'signal', pidFile, marker], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stderr = '';
+      child.stderr.on('data', (buf) => { stderr += buf; });
+      const deadline = Date.now() + 8000;
+      let text = '';
+      while (Date.now() < deadline) {
+        text = await fs.readFile(pidFile, 'utf8').catch(() => '');
+        if (text.includes('ready\n')) break;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      assert.match(text, /ready/, stderr || text);
+      const grand = Number(text.match(/^grand=(\d+)$/m)[1]);
+      const helper = Number(text.match(/^helper=(\d+)$/m)[1]);
+      const grandInfo = processIdentity(grand);
+      const helperInfo = processIdentity(helper);
+      assert.ok(grandInfo && helperInfo, text);
+      assert.equal(grandInfo.ppid, helper);
+      assert.notEqual(grandInfo.pgid, helperInfo.pgid);
+      assert.match(grandInfo.args, /cloud-firestore-emulator/);
+      process.kill(child.pid, signal);
+      const status = await new Promise((resolve) => child.once('exit', (exitCode) => resolve(exitCode)));
+      assert.equal(status, code, stderr);
+      assert.match(await fs.readFile(pidFile, 'utf8'), new RegExp(`signal=${signal}`));
+      assert.equal(processIdentity(grand), null);
+      assert.equal(processIdentity(helper), null);
+    });
   }
 });
