@@ -11,7 +11,7 @@ import { envelopeFromFirestoreFields } from '../secure/firestore-get.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'demo-blitz-secure';
-const OWNER_EMAIL = 'owner-synthetic@example.com';
+const SYNTHETIC_OWNER_EMAIL = 'owner-synthetic@example.com';
 const INTRUDER_EMAIL = 'intruder-synthetic@example.com';
 const firestoreHost = process.env.FIRESTORE_EMULATOR_HOST;
 const authHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
@@ -66,10 +66,10 @@ function docUrl(uid) {
 
 describe('private shell emulators', { concurrency: false }, () => {
   before(async () => {
-    users.owner = await createGoogleUser(OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner');
+    users.owner = await createGoogleUser(SYNTHETIC_OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner');
     users.intruder = await createGoogleUser(INTRUDER_EMAIL, 'synthetic-intruder-sub-001', 'Synthetic Intruder');
     await grantOwnerClaim(users.owner.uid);
-    const claimed = await createGoogleUser(OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner');
+    const claimed = await createGoogleUser(SYNTHETIC_OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner');
     assert.equal(claimed.uid, users.owner.uid);
     users.owner.idToken = claimed.idToken;
     const ownerToken = tokenPayload(users.owner.idToken);
@@ -148,7 +148,7 @@ describe('private shell emulators', { concurrency: false }, () => {
       shellDir: path.join(root, '.firebase-blitz-private-shell'),
       passphrase: DEMO_PASSPHRASE,
       artifactsDir: process.env.BLITZ_SECURE_ARTIFACTS || '/opt/cursor/artifacts',
-      ownerEmail: OWNER_EMAIL,
+      ownerEmail: SYNTHETIC_OWNER_EMAIL,
       intruderEmail: INTRUDER_EMAIL,
     });
     assert.ok(result.states.includes('signed-out'));

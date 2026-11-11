@@ -10,11 +10,12 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'demo-blitz-secure';
+// Emulator-only predicate for synthetic users. Not a deployable ruleset.
 const TEST_RULES = `rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     match /{document=**} {
-      allow read, write: if false;
+      allow get, list, create, update, delete: if false;
     }
     match /blitzOwners/{uid}/campaign/current {
       allow get: if request.auth != null

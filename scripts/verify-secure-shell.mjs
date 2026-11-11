@@ -114,8 +114,22 @@ export async function verifySecureShell(dir = SECURE_OUT) {
   return { files: files.length, emulator };
 }
 
+async function outputExists(dir) {
+  try {
+    await fs.access(dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  verifySecureShell().then((result) => {
+  outputExists(SECURE_OUT).then(async (ready) => {
+    if (!ready) {
+      const { buildSecureShell } = await import('./build-secure-shell.mjs');
+      await buildSecureShell({ emulator: true });
+    }
+    const result = await verifySecureShell();
     console.log(`Secure shell verified: ${result.files} files, no campaign ciphertext.`);
   }).catch((error) => {
     console.error(error.message);

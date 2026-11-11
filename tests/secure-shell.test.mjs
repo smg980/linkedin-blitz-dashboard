@@ -13,7 +13,7 @@ import { applyDocumentRead, createSession } from '../secure/session.mjs';
 import { syntheticPayload } from '../secure/synthetic-contacts.mjs';
 import { wipePrivateRoot } from '../secure/wipe.mjs';
 import { buildSecureShell } from '../scripts/build-secure-shell.mjs';
-import { FORBIDDEN_SNIPPETS, SECURE_SHELL_FILES, verifySecureShell } from '../scripts/verify-secure-shell.mjs';
+import { FORBIDDEN_SNIPPETS, SECURE_OUT, SECURE_SHELL_FILES, verifySecureShell } from '../scripts/verify-secure-shell.mjs';
 import { productionCsp } from '../secure/csp.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -237,4 +237,19 @@ test('envelope round-trip, wrong passphrase, and secure build contain no ciphert
     if (envPass) process.env.DASHBOARD_PASSPHRASE = envPass;
     await fs.rm(out, { recursive: true, force: true });
   }
+});
+
+test('verify:secure-shell builds the emulator shell when output is missing', async () => {
+  await fs.rm(SECURE_OUT, { recursive: true, force: true });
+  const env = { ...process.env };
+  delete env.DASHBOARD_PASSPHRASE;
+  const result = spawnSync(process.execPath, [path.join(root, 'scripts', 'verify-secure-shell.mjs')], {
+    cwd: root,
+    env,
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /no campaign ciphertext/);
+  const proof = await verifySecureShell(SECURE_OUT);
+  assert.equal(proof.files, SECURE_SHELL_FILES.length);
 });
