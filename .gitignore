@@ -16,3 +16,6 @@ assets-src/
 
 # Private shell Firebase web config (copy from secure-config.example.json)
 secure-config.local.json
+
+# Local D0 operator notes must never enter git or Hosting
+.d0-private/
