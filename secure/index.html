@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="__BLITZ_CSP__">
+<title>LinkedIn Blitz</title>
+<meta name="theme-color" content="#05070B">
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="img/favicon-32.png">
+<link rel="apple-touch-icon" href="img/apple-touch-icon.png">
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="blitz.css">
+<link rel="stylesheet" href="shell.css">
+<script src="config.js" defer></script>
+<script src="shell.js" defer></script>
+</head>
+<body data-state="signed-out">
+<main id="lock" class="lock">
+  <div class="lock-card">
+    <div class="brand-logo brand-logo--lock">
+      <picture><source srcset="img/logo-lock.webp" type="image/webp"><img src="img/logo-lock.png" width="520" height="219" alt="MASTER Intelligence"></picture>
+    </div>
+    <h1 id="gate-title">LinkedIn Blitz</h1>
+    <p id="gate-message" class="muted">Private campaign shell. Sign in with Google. Campaign data is not stored in this site.</p>
+    <form id="unlock-form" autocomplete="off" hidden>
+      <label class="sr-only" for="pass">Passphrase</label>
+      <div class="pass-row">
+        <input id="pass" name="pass" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="Passphrase" required>
+        <button id="unlock-btn" class="btn primary" type="submit">Unlock</button>
+      </div>
+    </form>
+    <div class="gate-actions">
+      <button type="button" class="btn primary" data-action="sign-in">Sign in with Google</button>
+      <button type="button" class="btn ghost" data-action="sign-out" hidden>Sign out</button>
+    </div>
+    <p id="gate-error" class="error" role="alert" hidden></p>
+    <p class="fine">AES-256-GCM · decrypted in this browser · read only · nothing is sent</p>
+  </div>
+</main>
+<div id="app" class="app" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo">
+        <picture><source srcset="img/logo-header.webp" type="image/webp"><img src="img/logo-header.png" width="264" height="111" alt="MASTER Intelligence"></picture>
+      </div>
+      <div class="brand-meta"><span class="product-label">Private Blitz</span><span class="brand-sub" id="subtitle"></span></div>
+    </div>
+    <div class="top-actions">
+      <button type="button" class="btn ghost" data-action="lock">Lock</button>
+      <button type="button" class="btn ghost" data-action="sign-out">Sign out</button>
+    </div>
+  </header>
+  <div id="example-banner" class="banner" hidden></div>
+  <main id="private-view" class="content"></main>
+  <footer class="foot"><span class="tagline">See the signal. Know the next move.</span><span id="private-foot"></span></footer>
+</div>
+</body>
+</html>
