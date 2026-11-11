@@ -56,3 +56,55 @@ a.doc-card:hover{border-color:var(--interactive)}
 .snapshot-warning{border:1px solid var(--line-strong);border-left:3px solid var(--warning);border-radius:10px;padding:10px 14px;font-size:13px;line-height:1.5}
 .snapshot-warning strong{color:var(--warning)}
 @media print{.filters,.queue-context,.queue-shortcuts,.snapshot-warning{display:none!important}}
+
+/*
+ * iPhone viewport guardrails (review-only; not a substitute for device QA).
+ * Prevent nested grid min-content sizing from pushing Lock and account cards
+ * outside the viewport. Keep the queue filter row scrollable on its own axis.
+ */
+@media (max-width:600px){
+  .topbar{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:10px 12px}
+  .brand{gap:7px;min-width:0;overflow:hidden}
+  .brand-logo img{width:clamp(64px,19vw,82px);height:auto}
+  .brand-meta{flex:1;min-width:0;padding-left:8px;gap:3px}
+  .product-label{font-size:10px;letter-spacing:.04em;white-space:nowrap}
+  .brand-sub{display:block;max-width:100%;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:10px;line-height:1.25}
+  .top-actions{min-width:0}
+  .top-actions .btn{min-height:44px;padding:9px 10px;white-space:nowrap}
+  .nav-seg{max-width:100%;min-width:0;padding:6px 12px;overscroll-behavior-inline:contain}
+  .nav-seg .seg-btn{min-height:44px}
+  .banner{padding:8px 12px;letter-spacing:.03em;font-size:11px}
+  .content{grid-template-columns:minmax(0,1fr);max-width:100%;min-width:0;padding:12px;gap:14px}
+  .content > *,.hero > *,.d-grid > *,.cards > *,.panel > *{min-width:0}
+  .hero{grid-template-columns:minmax(0,1fr);padding:16px;gap:14px}
+  .hero h2,.d-hero h1{overflow-wrap:anywhere}
+  .hero h2{font-size:21px}
+  .hero .meta{gap:6px 10px;font-size:12px}
+  .hero .actions{gap:8px;margin-top:14px}
+  .hero .actions .btn{min-height:44px}
+  .day-ring{justify-self:stretch;min-width:0}
+  .countdown{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .cd{min-width:0;padding:10px 6px}
+  .cd b{font-size:24px}
+  .stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .stat{min-width:0;padding:12px}
+  .stat .v{font-size:24px}
+  .panel{min-width:0;padding:14px}
+  .sched .day{grid-template-columns:minmax(0,1fr)}
+  .sched-items,.cards,.c-card,.doc-card{grid-template-columns:minmax(0,1fr);min-width:0}
+  .sched-item{min-width:0;padding:10px;gap:8px;align-items:flex-start}
+  .sched-item > div{min-width:0}
+  .sched-item b,.sched-item small,.card h3{overflow-wrap:anywhere}
+  .card{min-width:0;padding:14px;gap:9px}
+  .c-meta span,.chip{max-width:100%;overflow-wrap:anywhere}
+  .side{min-width:0}
+  .filters{max-width:100%;min-width:0;overscroll-behavior-inline:contain}
+  .d-grid{grid-template-columns:minmax(0,1fr);min-width:0}
+  .d-main,.d-side,.d-sec{min-width:0}
+  .d-hero h1{font-size:21px}
+  .d-sec{padding:14px}
+  .d-body,.draft blockquote,.q-text{overflow-wrap:anywhere}
+  .needs li{grid-template-columns:28px minmax(0,1fr);gap:10px}
+  .table-wrap{max-width:100%;overflow-x:auto;overscroll-behavior-inline:contain}
+  .foot{padding:6px 12px 28px}
+}
