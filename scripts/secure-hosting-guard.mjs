@@ -98,6 +98,34 @@ export function currentLiveRelease(text) {
   return { release: releaseName, version: versionName, versionId: versionMatch[1] };
 }
 
+// A live production secure shell, as fetched from the dedicated site before an
+// update. Distinguishes it from the fictional demo (app.js + data.enc.json) and
+// from an emulator build. Exactness of the new release is checked separately by
+// comparing the fetched files with the local build after deploy.
+export const LIVE_SHELL_FILES = ['index.html', 'config.js', 'shell.js'];
+const MAX_LIVE_FILE_BYTES = 4 * 1024 * 1024;
+
+export function assertLiveShell({ html, config, shell }) {
+  for (const [name, text] of [['index.html', html], ['config.js', config], ['shell.js', shell]]) {
+    if (typeof text !== 'string' || !text.length || text.length > MAX_LIVE_FILE_BYTES) {
+      throw new Error(`Live ${name} is missing or oversized`);
+    }
+  }
+  if (!html.includes('<meta http-equiv="Content-Security-Policy" content="default-src \'self\';')) {
+    throw new Error('Live shell has no production Content-Security-Policy');
+  }
+  if (!/frame-ancestors 'none'/.test(html)) throw new Error('Live shell CSP does not deny framing');
+  for (const marker of ['<script src="config.js" defer></script>', '<script src="shell.js" defer></script>', 'id="unlock-form"']) {
+    if (!html.includes(marker)) throw new Error('Live page is not the secure shell');
+  }
+  if (/data\.enc\.json|src="app\.js"|useEmulators"\s*:\s*true/.test(html)) {
+    throw new Error('Live page references the public demo or emulator');
+  }
+  assertPrivateWebConfig(config);
+  if (/data\.enc\.json/.test(shell)) throw new Error('Live shell script references public ciphertext');
+  return true;
+}
+
 function parseJson(file) { return JSON.parse(fs.readFileSync(file, 'utf8')); }
 
 async function main() {
@@ -118,8 +146,14 @@ async function main() {
     console.log(value.release);
     console.log(value.version);
     console.log(value.versionId);
+  } else if (mode === '--live-shell') {
+    const dir = process.argv[3];
+    if (!dir) throw new Error('Use --live-shell <directory of fetched files>');
+    const read = (name) => fs.readFileSync(path.join(dir, name), 'utf8');
+    assertLiveShell({ html: read('index.html'), config: read('config.js'), shell: read('shell.js') });
+    console.log('PASS: live site serves a production secure shell');
   } else {
-    throw new Error('Use --assert-config, --assert-shell, --require-site, or --release');
+    throw new Error('Use --assert-config, --assert-shell, --require-site, --release, or --live-shell');
   }
 }
 

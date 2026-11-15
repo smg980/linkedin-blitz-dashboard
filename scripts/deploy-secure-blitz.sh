@@ -9,6 +9,15 @@
 # BLITZ_EXPECTED_DEMO_RELEASE must be that release.name, copied from a separate
 # read-only GET of the same channel. It is not a short id and not a version id.
 #
+# BLITZ_RELEASE_BASELINE selects what must be live before the deploy:
+#   demo  (default) the original fictional demo, checked by its data.enc.json hash,
+#         with BLITZ_EXPECTED_DEMO_RELEASE. This was the one-time Step C replacement.
+#   shell an already-live production secure shell (data.enc.json 404, production
+#         config.js, shell markers), with BLITZ_EXPECTED_LIVE_RELEASE. This is the
+#         repeatable update path for later shell releases.
+# Either way, after the deploy the live index.html, config.js and shell.js must be
+# byte-identical to the local build of the approved commit.
+#
 # This script never runs a rollback. If the deploy starts and verification does
 # not pass, it prints STEP_C_ROLLBACK_COMMAND. That command re-releases only the
 # captured version on this site's live channel. It is not hosting:disable, and
@@ -24,6 +33,9 @@ release_url="https://firebasehosting.googleapis.com/v1beta1/sites/${SITE}/channe
 
 main_pid=$BASHPID
 token_file=""
+scratch_dirs=()
+scratch_dir=""
+expected_release=""
 deploy_started=0
 deploy_verified=0
 rollback_command=""
@@ -56,6 +68,8 @@ cleanup() {
   # original shell may delete the token or report a failed deploy.
   [[ "$BASHPID" == "$main_pid" ]] || return 0
   if [[ -n "$token_file" ]]; then rm -f "$token_file"; fi
+  local dir
+  for dir in ${scratch_dirs[@]+"${scratch_dirs[@]}"}; do rm -rf "$dir"; done
   if [[ "$deploy_started" == 1 && "$deploy_verified" != 1 && -n "$rollback_command" ]]; then
     echo "STOP: the Hosting deploy was started and verification did not pass." >&2
     echo "Do not retry the deploy and do not deploy any other target." >&2
@@ -68,14 +82,28 @@ trap 'exit 130' INT TERM
 [[ -z "${CI:-}" && -z "${GITHUB_ACTIONS:-}" ]] || stop 'Never deploy from CI.'
 [[ "${BLITZ_APPROVE_SECURE_SHELL_DEPLOY:-}" == 'YES' ]] || stop 'Explicit Step C opt-in is required.'
 [[ -z "${DASHBOARD_PASSPHRASE:-}" ]] || stop 'No campaign passphrase may be in the environment.'
+RELEASE_BASELINE="${BLITZ_RELEASE_BASELINE:-demo}"
+case "$RELEASE_BASELINE" in
+  demo)
+    [[ -z "${BLITZ_EXPECTED_LIVE_RELEASE:-}" ]] || stop 'The demo baseline uses BLITZ_EXPECTED_DEMO_RELEASE, not BLITZ_EXPECTED_LIVE_RELEASE.'
+    expected_release="${BLITZ_EXPECTED_DEMO_RELEASE:-}"
+    ;;
+  shell)
+    [[ -z "${BLITZ_EXPECTED_DEMO_RELEASE:-}" ]] || stop 'The shell baseline uses BLITZ_EXPECTED_LIVE_RELEASE, not BLITZ_EXPECTED_DEMO_RELEASE.'
+    expected_release="${BLITZ_EXPECTED_LIVE_RELEASE:-}"
+    ;;
+  *) stop 'BLITZ_RELEASE_BASELINE must be demo or shell.' ;;
+esac
 [[ -n "${BLITZ_APPROVED_COMMIT:-}" ]] || stop 'Pinned reviewed commit is required.'
 [[ "$(git rev-parse HEAD)" == "$BLITZ_APPROVED_COMMIT" ]] || stop 'Checkout is not the approved commit.'
 [[ -z "$(git status --porcelain)" ]] || stop 'Dirty checkout; preserve uncommitted work.'
+[[ -n "$expected_release" ]] || stop 'The exact expected live release name is required.'
 command -v firebase >/dev/null || stop 'Authorized Firebase CLI missing.'
 command -v gcloud >/dev/null || stop 'Authorized gcloud missing.'
 command -v curl >/dev/null || stop 'curl missing.'
 command -v node >/dev/null || stop 'node missing.'
 command -v sha256sum >/dev/null || stop 'sha256sum missing.'
+command -v cmp >/dev/null || stop 'cmp missing.'
 [[ -f "${BLITZ_SECURE_CONFIG:-secure-config.local.json}" ]] || stop 'Untracked Firebase WEB config missing; do not create credentials.'
 
 node scripts/secure-hosting-guard.mjs --assert-config || stop 'Private Hosting config check failed.'
@@ -89,10 +117,14 @@ fi
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
+    -u BLITZ_EXPECTED_LIVE_RELEASE \
+    -u BLITZ_RELEASE_BASELINE \
     npm test || stop 'npm test failed.'
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
+    -u BLITZ_EXPECTED_LIVE_RELEASE \
+    -u BLITZ_RELEASE_BASELINE \
     npm run verify:bundle || stop 'verify:bundle failed.'
 BLITZ_SECURE_ATTEST_NONCE="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" || stop 'Cannot create the secure suite attestation.'
 [[ "$BLITZ_SECURE_ATTEST_NONCE" =~ ^[0-9a-f]{32}$ ]] || stop 'Cannot create the secure suite attestation.'
@@ -102,6 +134,8 @@ export BLITZ_SECURE_ATTEST_NONCE BLITZ_SECURE_ATTEST_PATH
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
+    -u BLITZ_EXPECTED_LIVE_RELEASE \
+    -u BLITZ_RELEASE_BASELINE \
     npm run test:secure || stop 'test:secure failed.'
 require_suite_attestation || stop 'Secure suite attestation is missing or does not match this run.'
 node scripts/build-secure-shell.mjs --config "${BLITZ_SECURE_CONFIG:-secure-config.local.json}" || stop 'Secure shell build failed.'
@@ -156,6 +190,49 @@ verify_demo_sha() {
   [[ "$demo_sha" == "$DEMO_SHA" ]] || stop 'Live Hosting content is not the approved fictional demo.'
 }
 
+# Sets scratch_dir in this shell (not a subshell) so cleanup sees every directory.
+new_scratch() {
+  scratch_dir="$(mktemp -d)" || return 1
+  scratch_dirs+=("$scratch_dir")
+  chmod 700 "$scratch_dir" || return 1
+}
+
+fetch_live_shell() {
+  # Fetches the three shell files without following redirects or decoding.
+  local dir="$1" name url
+  for name in index.html config.js shell.js; do
+    if [[ "$name" == 'index.html' ]]; then
+      url="https://${SITE}.web.app/"
+    else
+      url="https://${SITE}.web.app/${name}"
+    fi
+    curl --fail --silent --show-error --max-time 20 --retry 0 \
+      -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      -o "${dir}/${name}" "$url" || return 1
+  done
+}
+
+verify_shell_baseline() {
+  local dir code
+  new_scratch || return 1
+  dir="$scratch_dir"
+  fetch_live_shell "$dir" || return 1
+  node scripts/secure-hosting-guard.mjs --live-shell "$dir" || return 1
+  code="$(http_code "https://${SITE}.web.app/data.enc.json")" || return 1
+  [[ "$code" == '404' ]] || return 1
+}
+
+verify_live_matches_build() {
+  local dir name
+  new_scratch || return 1
+  dir="$scratch_dir"
+  fetch_live_shell "$dir" || return 1
+  for name in index.html config.js shell.js; do
+    cmp -s "${dir}/${name}" ".firebase-blitz-private-shell/${name}" || return 1
+  done
+  node scripts/secure-hosting-guard.mjs --live-shell "$dir" || return 1
+}
+
 http_code() {
   curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 20 --retry 0 \
     -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$1"
@@ -167,14 +244,19 @@ previous_release="$(printf '%s\n' "$previous" | sed -n '1p')"
 previous_version="$(printf '%s\n' "$previous" | sed -n '2p')"
 previous_version_id="$(printf '%s\n' "$previous" | sed -n '3p')"
 validate_release_fields "$previous_release" "$previous_version" "$previous_version_id" || stop 'Invalid rollback source.'
-[[ "${BLITZ_EXPECTED_DEMO_RELEASE:-}" == "$previous_release" ]] || stop "Current live release does not equal the explicitly verified fictional-demo release. Captured: ${previous_release}"
-verify_demo_sha || stop 'Cannot verify existing fictional demo.'
+[[ "$expected_release" == "$previous_release" ]] || stop "Current live release does not equal the explicitly verified ${RELEASE_BASELINE} release. Captured: ${previous_release}"
+if [[ "$RELEASE_BASELINE" == 'shell' ]]; then
+  verify_shell_baseline || stop 'Live Hosting content is not a production secure shell with no public ciphertext.'
+else
+  verify_demo_sha || stop 'Cannot verify existing fictional demo.'
+fi
 require_billing_off 'Billing changed before deploy.' || stop 'Billing changed before deploy.'
 capture_live || stop 'Could not re-read the live Hosting release.'
 [[ "$captured" == "$previous" ]] || stop 'Concurrent Hosting change detected.'
 require_suite_attestation || stop 'Secure suite attestation is missing or does not match this run.'
 
 rollback_command="firebase hosting:clone --project ${PROJECT} --non-interactive ${SITE}@${previous_version_id} ${SITE}:live"
+echo "STEP_C_BASELINE=${RELEASE_BASELINE}"
 echo "STEP_C_LIVE_RELEASE=${previous_release}"
 echo "STEP_C_LIVE_VERSION=${previous_version}"
 echo "STEP_C_ROLLBACK_COMMAND=${rollback_command}"
@@ -193,6 +275,7 @@ shell_code="$(http_code "https://${SITE}.web.app/")" || stop 'Could not read the
 [[ "$shell_code" == '200' ]] || stop "Private shell did not return HTTP 200 (got ${shell_code})."
 cipher_code="$(http_code "https://${SITE}.web.app/data.enc.json")" || stop 'Could not read the ciphertext path HTTP status.'
 [[ "$cipher_code" == '404' ]] || stop "Public ciphertext path returned HTTP ${cipher_code}; immediate operator review required."
+verify_live_matches_build || stop 'Live shell files are not byte-identical to the approved local build.'
 require_billing_off 'Billing state changed.'
 deploy_verified=1
 echo "STEP_C_DEPLOY_VERIFIED: new release ${new_release}; shell HTTP 200; public ciphertext 404; billing OFF."
