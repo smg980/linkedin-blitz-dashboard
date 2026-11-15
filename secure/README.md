@@ -8,6 +8,12 @@ The client does not write to Firestore, does not list the collection, and does n
 
 Access rules for the live project are prepared separately. This client treats a missing document and a permission denial as not authorized and offers sign-out. It does not embed an owner identity.
 
+## Sign-in on iPhone Safari
+
+Desktop browsers start with the Google popup. iPhone Safari starts with a redirect only when `authDomain` is the host that serves the shell (or in the loopback emulator). With the default `master-intelligence-5496f.firebaseapp.com` authDomain the shell is on a different site, Safari 16.1+ blocks the storage that `getRedirectResult` reads, and a redirect would return signed out. In that case iPhone Safari uses the popup too. If the popup is blocked and a redirect cannot complete, the shell asks the user to allow pop-ups instead of redirecting.
+
+Setting `authDomain` to `master-intelligence-5496f-lb.web.app` would let iPhone Safari use the redirect again. That also needs `https://master-intelligence-5496f-lb.web.app/__/auth/handler` as an authorized redirect URI on the OAuth client, which is a Firebase Auth configuration change with its own approval. The emulator test cannot prove either path on a physical iPhone; test on a device before relying on it.
+
 ## Local proof
 
 ```bash
