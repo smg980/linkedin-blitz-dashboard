@@ -18,7 +18,7 @@ const PROJECT = 'demo-blitz-secure';
 export const SUITE_TIMEOUT_MS = 9 * 60 * 1000;
 const TEST_TIMEOUT_MS = 180000;
 // Emulator-only predicate for synthetic users. Not a deployable ruleset.
-const TEST_RULES = `rules_version = '2';
+export const TEST_RULES = `rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     match /{document=**} {
