@@ -65,6 +65,23 @@ function clearPrivate() {
   $('private-foot').textContent = '';
 }
 
+// The button reflects only the unlock bound to the current session. A stale
+// unlock never writes to it; the transition that made it stale re-renders.
+function renderUnlockButton() {
+  const button = $('unlock-btn');
+  const pending = session.unlockPending();
+  button.disabled = pending;
+  button.textContent = pending ? 'Checking…' : 'Unlock';
+}
+
+// Advances the authentication generation. Every document read and unlock that
+// started before this call is stale and may not change state or the DOM.
+function invalidateAuth() {
+  generation += 1;
+  loadedFor = '';
+  inflight.clear();
+}
+
 function render() {
   const state = session.state();
   document.body.dataset.state = state;
@@ -78,6 +95,7 @@ function render() {
   }
   const showForm = state === 'locked' || state === 'wrong-passphrase';
   $('unlock-form').hidden = !showForm;
+  renderUnlockButton();
   document.querySelector('[data-action="sign-in"]').hidden = state !== 'signed-out';
   document.querySelector('#lock [data-action="sign-out"]').hidden = !(state === 'not-authorized' || showForm);
   const error = $('gate-error');
@@ -113,32 +131,37 @@ function googleProvider() {
 function loadDocument(user) {
   if (!user?.uid) return Promise.resolve();
   if (loadedFor === user.uid && ['locked', 'wrong-passphrase', 'unlocked'].includes(session.state())) return Promise.resolve();
-  if (inflight.has(user.uid)) return inflight.get(user.uid);
+  const running = inflight.get(user.uid);
+  if (running && running.gen === generation) return running.promise;
   const gen = ++generation;
-  const promise = readSignedInDocument(user, gen).finally(() => inflight.delete(user.uid));
-  inflight.set(user.uid, promise);
+  const promise = readSignedInDocument(user, gen).finally(() => {
+    if (inflight.get(user.uid)?.promise === promise) inflight.delete(user.uid);
+  });
+  inflight.set(user.uid, { gen, promise });
   return promise;
 }
 
 async function readSignedInDocument(user, gen) {
+  // The read belongs to this generation and to the user Firebase reports now.
+  const current = () => gen === generation && auth?.currentUser?.uid === user.uid;
   loadedFor = '';
   session.signInStart();
   render();
   try {
     // One forced refresh so a claim granted after the first token is visible.
     const token = await user.getIdToken(true);
-    if (gen !== generation) return;
+    if (!current()) return;
     const result = await readPrivateDocument({
       origin: firestoreOrigin(),
       projectId: config.firebase.projectId,
       uid: user.uid,
       token,
     });
-    if (gen !== generation) return;
+    if (!current()) return;
     applyDocumentRead(session, result);
     if (session.state() === 'locked') loadedFor = user.uid;
   } catch {
-    if (gen !== generation) return;
+    if (!current()) return;
     session.notAuthorized('denied');
   }
   render();
@@ -176,8 +199,7 @@ async function onSignIn() {
 }
 
 async function onSignOut() {
-  generation += 1;
-  loadedFor = '';
+  invalidateAuth();
   session.signOut();
   $('pass').value = '';
   render();
@@ -192,33 +214,50 @@ function onLock() {
   render();
 }
 
+// An unlock is bound to the auth generation, the signed-in uid, the session
+// epoch and the exact envelope object it started with. Lock, sign-out, an
+// account change or a new document read invalidates it.
+function unlockStillCurrent(ticket) {
+  return ticket.generation === generation
+    && ticket.uid !== ''
+    && ticket.uid === loadedFor
+    && auth?.currentUser?.uid === ticket.uid
+    && session.isCurrentUnlock(ticket);
+}
+
 async function onUnlock(event) {
   event.preventDefault();
   const input = $('pass');
-  const button = $('unlock-btn');
-  if (!session.ciphertext()) {
+  if (session.unlockPending()) return;
+  if (!session.ciphertext() || !loadedFor) {
     session.notAuthorized('missing');
     render();
     return;
   }
+  if (session.state() !== 'locked' && session.state() !== 'wrong-passphrase') return;
+  const ticket = session.beginUnlock({ generation, uid: loadedFor });
   const chars = Array.from(input.value);
   input.value = '';
   const passphrase = chars.join('');
   chars.fill('');
-  button.disabled = true;
-  button.textContent = 'Checking…';
+  renderUnlockButton();
   await new Promise((resolve) => setTimeout(resolve, 0));
+  let data = null;
+  let ok = false;
   try {
-    const data = await decryptEnvelope(session.ciphertext(), passphrase);
-    session.unlocked(data);
-    render();
+    if (unlockStillCurrent(ticket)) {
+      data = await decryptEnvelope(ticket.envelope, passphrase);
+      ok = true;
+    }
   } catch {
-    session.wrongPassphrase();
-    render();
-  } finally {
-    button.disabled = false;
-    button.textContent = 'Unlock';
+    ok = false;
   }
+  // A result from an earlier sign-in, session or envelope is dropped here with
+  // no state change and no DOM write.
+  if (!unlockStillCurrent(ticket)) return;
+  if (ok) session.finishUnlock(ticket, data);
+  else session.failUnlock(ticket);
+  render();
 }
 
 async function boot() {
@@ -235,10 +274,13 @@ async function boot() {
     connectAuthEmulator(auth, `http://${emu.authHost}:${emu.authPort}`, { disableWarnings: true });
   }
   onAuthStateChanged(auth, (user) => {
-    if (user) loadDocument(user);
-    else if (session.state() !== 'signing-in' && session.state() !== 'signed-out') {
-      generation += 1;
-      loadedFor = '';
+    if (user) {
+      loadDocument(user);
+      return;
+    }
+    // No user: nothing started for an earlier sign-in may still land.
+    invalidateAuth();
+    if (session.state() !== 'signing-in' && session.state() !== 'signed-out') {
       session.signOut();
       $('pass').value = '';
       render();
