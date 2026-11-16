@@ -18,6 +18,9 @@ const ASSETS = [
   'img/logo-header.png', 'img/logo-header.webp',
   'img/logo-lock.png', 'img/logo-lock.webp',
 ];
+// Exactly what a fictional demo Hosting version serves. Used to check that a demo
+// rollback target has nothing else in it.
+export const DEMO_HOSTING_FILES = Object.freeze([...ASSETS, 'data.enc.json'].sort());
 
 async function listFiles(root, relative = '') {
   const entries = await fs.readdir(path.join(root, relative), { withFileTypes: true });
