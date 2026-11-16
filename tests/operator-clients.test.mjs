@@ -34,8 +34,8 @@ async function tempDir(prefix) {
   return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
 }
 
-async function harness({ commitFault } = {}) {
-  const firestore = await startFirestoreServer({ tls: TLS, commitFault });
+async function harness({ commitFault, initialFields, onBatchGet } = {}) {
+  const firestore = await startFirestoreServer({ tls: TLS, commitFault, initialFields, onBatchGet });
   const identity = await startIdentityToolkit({ tls: TLS, user: syntheticOwnerRecord(UID) });
   const tokens = tokenTransporter();
   const work = await tempDir('blitz-r3-');
@@ -240,4 +240,121 @@ test('R4: runCleanup attempts every step, bounds a hanging one and reports incom
   assert.deepEqual(ran, ['throws', 'hangs', 'last']);
   assert.ok(Date.now() - started < 10000);
   assert.equal(await runCleanup([async () => {}, null]), true);
+});
+
+// R6: the backup and receipt directories are checked (real path, outside the
+// repository) when the run starts, but the files are created later, after
+// network round trips. If the checked directory is replaced by a symlink into
+// the repository in between, path-based creation follows it. The swap happens
+// at the first or second Firestore read, as a racing process would.
+const { encodeFields } = await import('./helpers/google-transport.mjs');
+const { fileURLToPath } = await import('node:url');
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const envB = await encryptEnvelope({ ...syntheticPayload(), generatedAt: 'r6-second' }, PASS);
+const digestB = envelopeDigest(envB);
+
+async function swapTarget() {
+  return fs.mkdtemp(path.join(REPO, '.r6-swap-target-'));
+}
+
+async function filesUnder(dir) {
+  const out = [];
+  for (const name of await fs.readdir(dir).catch(() => [])) {
+    const full = path.join(dir, name);
+    const info = await fs.lstat(full);
+    out.push({ name, size: info.size, text: info.isFile() ? await fs.readFile(full, 'utf8') : '' });
+  }
+  return out;
+}
+
+function swapAt(n, dir, target) {
+  return async (count) => {
+    if (count !== n) return;
+    await fs.rename(dir, `${dir}.moved`);
+    await fs.symlink(target, dir, 'dir');
+  };
+}
+
+async function replaceRun({ swap }) {
+  const target = await swapTarget();
+  const holder = {};
+  const h = await harness({ initialFields: encodeFields(envelope), onBatchGet: (n) => holder.hook?.(n) });
+  const backupDir = path.join(h.work, 'backup-dir');
+  const receiptDir = path.join(h.work, 'receipt-dir');
+  await fs.mkdir(backupDir, { mode: 0o700 });
+  await fs.mkdir(receiptDir, { mode: 0o700 });
+  const input = path.join(h.work, 'envelope-b.json');
+  await fs.writeFile(input, JSON.stringify(envB));
+  holder.hook = swap({ backupDir, receiptDir, target });
+  const args = ['write', '--target', 'production', '--project', PRODUCTION_PROJECT, '--input', input,
+    '--expect-current', digest, '--backup', path.join(backupDir, 'backup.json'), '--receipt', path.join(receiptDir, 'receipt.json'), '--apply'];
+  const env = { ...writeEnv(h), BLITZ_STORE_APPROVAL: `WRITE:${digestB}` };
+  const outcome = await main(args, env, h.deps).then((result) => ({ result }), (error) => ({ error }));
+  const leaked = await filesUnder(target);
+  return { h, outcome, leaked, target };
+}
+
+const R6 = { skip: !HAVE_OPENSSL && 'openssl unavailable' };
+
+test('R6: a backup directory swapped for a symlink into the repository receives no ciphertext and nothing commits', R6, async () => {
+  const { h, outcome, leaked, target } = await replaceRun({ swap: ({ backupDir, target: t }) => swapAt(1, backupDir, t) });
+  try {
+    assert.deepEqual(leaked.filter((f) => f.size > 0).map((f) => f.name), [], 'no content written inside the repository');
+    assert.ok(!leaked.some((f) => f.text.includes(envelope.ct)), 'no ciphertext inside the repository');
+    assert.equal(h.firestore.state.commits.length, 0);
+    assert.equal(outcome.error?.code, 'STORE_BACKUP_FAILED');
+    assert.equal(outcome.error?.outcome, 'refused-before-write');
+  } finally {
+    await fs.rm(target, { recursive: true, force: true });
+    await h.close();
+  }
+});
+
+test('R6: a receipt directory swapped before the receipt exists receives nothing and nothing commits', R6, async () => {
+  const { h, outcome, leaked, target } = await replaceRun({ swap: ({ receiptDir, target: t }) => swapAt(1, receiptDir, t) });
+  try {
+    assert.deepEqual(leaked.filter((f) => f.size > 0).map((f) => f.name), []);
+    assert.equal(h.firestore.state.commits.length, 0);
+    assert.equal(outcome.error?.code, 'STORE_RECEIPT_FAILED');
+    assert.equal(outcome.error?.outcome, 'refused-before-write');
+  } finally {
+    await fs.rm(target, { recursive: true, force: true });
+    await h.close();
+  }
+});
+
+test('R6: a receipt directory swapped mid-run never receives a receipt update; the commit is still reported', R6, async () => {
+  const { h, outcome, leaked, target } = await replaceRun({ swap: ({ receiptDir, target: t }) => swapAt(2, receiptDir, t) });
+  try {
+    assert.deepEqual(leaked.filter((f) => f.size > 0).map((f) => f.name), [], 'no receipt content inside the repository');
+    // The commit happened and was verified; only the receipt could not record it (exit 5).
+    assert.equal(h.firestore.state.commits.length, 1);
+    assert.equal(outcome.error?.code, 'STORE_RECEIPT_FAILED_AFTER_COMMIT');
+    assert.equal(outcome.error?.outcome, 'committed-verified');
+  } finally {
+    await fs.rm(target, { recursive: true, force: true });
+    await h.close();
+  }
+});
+
+test('R6: backup and receipt directories must be private to the operator', R6, async () => {
+  const h = await harness({ initialFields: encodeFields(envelope) });
+  try {
+    const open = path.join(h.work, 'open-dir');
+    await fs.mkdir(open);
+    await fs.chmod(open, 0o755);
+    const input = path.join(h.work, 'envelope-b.json');
+    await fs.writeFile(input, JSON.stringify(envB));
+    const base = ['write', '--target', 'production', '--project', PRODUCTION_PROJECT, '--input', input, '--expect-current', digest, '--apply'];
+    const env = { ...writeEnv(h), BLITZ_STORE_APPROVAL: `WRITE:${digestB}` };
+    const priv = path.join(h.work, 'priv');
+    await fs.mkdir(priv, { mode: 0o700 });
+    const e1 = await main([...base, '--backup', path.join(open, 'b.json'), '--receipt', path.join(priv, 'r.json')], env, h.deps).catch((e) => e);
+    assert.equal(e1.code, 'STORE_BACKUP_DIRECTORY_NOT_PRIVATE');
+    const e2 = await main([...base, '--backup', path.join(priv, 'b.json'), '--receipt', path.join(open, 'r.json')], env, h.deps).catch((e) => e);
+    assert.equal(e2.code, 'STORE_RECEIPT_DIRECTORY_NOT_PRIVATE');
+    assert.equal(h.firestore.state.commits.length, 0);
+  } finally {
+    await h.close();
+  }
 });

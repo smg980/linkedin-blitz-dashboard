@@ -97,7 +97,7 @@ const ts = () => ({ seconds: String(Math.floor(Date.now() / 1000)), nanos: 0 });
 
 // commitFault(n, request, apply) lets a test decide what Commit attempt n does:
 // return null to succeed, or a gRPC status object to fail (after or before apply()).
-export async function startFirestoreServer({ tls: tlsMaterial, initialFields = null, commitFault = null }) {
+export async function startFirestoreServer({ tls: tlsMaterial, initialFields = null, commitFault = null, onBatchGet = null }) {
   const { grpc, loader, protos } = grpcModules();
   const definition = loader.loadSync('google/firestore/v1/firestore.proto', {
     includeDirs: protos, keepCase: false, longs: String, enums: String, defaults: true, oneofs: true,
@@ -112,9 +112,10 @@ export async function startFirestoreServer({ tls: tlsMaterial, initialFields = n
   const deny = { code: grpc.status.UNAUTHENTICATED, details: 'synthetic transport: unexpected credential' };
   const server = new grpc.Server();
   server.addService(service, {
-    batchGetDocuments(call) {
+    async batchGetDocuments(call) {
       state.batchGets += 1;
       if (!authorized(call)) { call.emit('error', deny); return; }
+      if (onBatchGet) await onBatchGet(state.batchGets);
       const [name] = call.request.documents;
       const message = { readTime: ts() };
       if (call.request.newTransaction) message.transaction = Buffer.from(`synthetic-tx-${state.batchGets}`);
