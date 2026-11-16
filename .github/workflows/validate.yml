@@ -67,8 +67,10 @@ jobs:
           node --check secure/campaign-store.mjs
           node --check secure/operator-lock.mjs
           node --check scripts/blitz-operator-lock.mjs
+          node --check scripts/export-private-envelope.mjs
           node --check tests/campaign-store-recovery.test.mjs
           node --check tests/operator-controls.test.mjs
+          node --check tests/export-private-envelope.test.mjs
           node --check scripts/blitz-campaign-store.mjs
           node --check scripts/run-campaign-store-suite.mjs
           node --check tests/campaign-store.integration.mjs

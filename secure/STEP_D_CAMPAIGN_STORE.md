@@ -39,11 +39,12 @@ This tool writes, replaces or retracts the one owner document the secure shell r
 
 ## Producing the envelope (owner, private machine)
 
-Use the **rotated** passphrase, not the one exposed on Oct 31. Write the envelope outside the repo so the GitHub Pages bundle is not changed:
+Use the **rotated** passphrase, not the one exposed on Oct 31. Use only the private export wrapper: `scripts/build.mjs` on its own writes into the public `docs/` folder whenever `BLITZ_OUTPUT_DIR` is missing. The wrapper refuses an output folder inside the repo, one that is not mode 700 and owned by you, an existing `data.enc.json`, a source inside the repo, a `BLITZ_OUTPUT_DIR` in the environment, and any build flag. It stops if `docs/data.enc.json` or `git status` changed, or if the build left anything but one strict envelope, and removes its staging folder either way. It prints only the envelope digest.
 
 ```bash
-BLITZ_DIR=<private campaign source folder> BLITZ_OUTPUT_DIR=<private folder outside the repo> \
-  DASHBOARD_PASSPHRASE='<rotated passphrase>' node scripts/build.mjs
+mkdir -m 700 <private folder outside the repo>
+BLITZ_DIR=<private campaign source folder> DASHBOARD_PASSPHRASE='<rotated passphrase>' \
+  node scripts/export-private-envelope.mjs --out <private folder outside the repo>
 unset DASHBOARD_PASSPHRASE
 ```
 
@@ -88,5 +89,5 @@ Retracting removes the document from Firestore. It cannot recall copies a signed
 
 ## Tests
 
-- `npm test`: unit tests with in-memory Firestore/Auth fakes. They cover refusals, CAS, backup verification, round-trips, and the CLI refusing before the SDK loads; plus `campaign-store-recovery.test.mjs` (receipts, lost acknowledgement, failed readback, concurrent update, backup failure, replacement rollback, claim race, path boundaries), `operator-controls.test.mjs` (credential provenance, identity binding, operator lock).
+- `npm test`: unit tests with in-memory Firestore/Auth fakes. They cover refusals, CAS, backup verification, round-trips, and the CLI refusing before the SDK loads; plus `campaign-store-recovery.test.mjs` (receipts, lost acknowledgement, failed readback, concurrent update, backup failure, replacement rollback, claim race, path boundaries), `operator-controls.test.mjs` (credential provenance, identity binding, operator lock) and `export-private-envelope.test.mjs`.
 - `npm run test:store`: Auth and Firestore emulators with the secure-shell rules. The Admin SDK writes; the browser's own `readPrivateDocument` reads and decrypts. It requires exactly 3/3.
