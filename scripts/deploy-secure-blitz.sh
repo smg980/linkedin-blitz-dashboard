@@ -17,12 +17,22 @@
 #         repeatable update path for later shell releases.
 # Either way, after the deploy every live file must be byte-identical to the
 # frozen release manifest (F2 below).
+# R2: shell also needs BLITZ_APPROVED_BASELINE_RECORD (a file holding the
+# STEP_C_RELEASE_RECORD line a previous verified deploy printed, plus a
+# newline) and BLITZ_APPROVED_BASELINE_RECORD_SHA256 (its independently
+# approved STEP_C_RELEASE_RECORD_SHA256). The live version, its Hosting content
+# hashes and every served byte must equal that record before anything deploys,
+# so a shell that merely looks right (arbitrary shell.js) is not a baseline.
 #
 # F2: the reviewed build is frozen once into a private release root outside the
 # repository (scripts/secure-release.mjs) with a SHA-256 manifest of every file.
 # firebase deploy reads only that root. The manifest digest printed as
 # STEP_C_RELEASE_MANIFEST_SHA256 binds the pre-deploy re-check, the post-deploy
 # re-check, the live version's file list and every live byte.
+# R1: `firebase deploy --json` reports the version it created; the live channel
+# must serve exactly that version, its Hosting content hashes (SHA-256 of the
+# CLI's level-9 gzip) must equal the frozen files', and the channel is re-read
+# after all checks so drift during verification stops the run.
 # F3: after the deploy every file must answer 200 with no redirect and with the
 # exact approved CSP and security headers; the page must carry the exact CSP and
 # load only config.js and shell.js. The rollback version must list exactly the
@@ -101,6 +111,7 @@ RELEASE_BASELINE="${BLITZ_RELEASE_BASELINE:-demo}"
 case "$RELEASE_BASELINE" in
   demo)
     [[ -z "${BLITZ_EXPECTED_LIVE_RELEASE:-}" ]] || stop 'The demo baseline uses BLITZ_EXPECTED_DEMO_RELEASE, not BLITZ_EXPECTED_LIVE_RELEASE.'
+    [[ -z "${BLITZ_APPROVED_BASELINE_RECORD:-}${BLITZ_APPROVED_BASELINE_RECORD_SHA256:-}" ]] || stop 'The demo baseline takes no baseline record.'
     expected_release="${BLITZ_EXPECTED_DEMO_RELEASE:-}"
     ;;
   shell)
@@ -113,6 +124,12 @@ esac
 [[ "$(git rev-parse HEAD)" == "$BLITZ_APPROVED_COMMIT" ]] || stop 'Checkout is not the approved commit.'
 [[ -z "$(git status --porcelain)" ]] || stop 'Dirty checkout; preserve uncommitted work.'
 [[ -n "$expected_release" ]] || stop 'The exact expected live release name is required.'
+# R2: the live shell is a rollback target only if it is exactly an
+# independently approved release record (bytes, Hosting hashes, version).
+if [[ "$RELEASE_BASELINE" == 'shell' ]]; then
+  [[ -n "${BLITZ_APPROVED_BASELINE_RECORD:-}" && "${BLITZ_APPROVED_BASELINE_RECORD_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] \
+    || stop 'The shell baseline needs BLITZ_APPROVED_BASELINE_RECORD and its approved BLITZ_APPROVED_BASELINE_RECORD_SHA256.'
+fi
 command -v firebase >/dev/null || stop 'Authorized Firebase CLI missing.'
 command -v gcloud >/dev/null || stop 'Authorized gcloud missing.'
 command -v curl >/dev/null || stop 'curl missing.'
@@ -120,6 +137,10 @@ command -v node >/dev/null || stop 'node missing.'
 command -v sha256sum >/dev/null || stop 'sha256sum missing.'
 [[ -f "${BLITZ_SECURE_CONFIG:-secure-config.local.json}" ]] || stop 'Untracked Firebase WEB config missing; do not create credentials.'
 
+if [[ "$RELEASE_BASELINE" == 'shell' ]]; then
+  node scripts/secure-release.mjs --check-baseline-record "$BLITZ_APPROVED_BASELINE_RECORD" "$BLITZ_APPROVED_BASELINE_RECORD_SHA256" "$SITE" \
+    || stop 'The approved baseline record is invalid or does not match its approved digest.'
+fi
 node scripts/secure-hosting-guard.mjs --assert-config || stop 'Private Hosting config check failed.'
 require_billing_off 'Billing is not verified OFF.' || stop 'Billing is not verified OFF.'
 if ! firebase hosting:sites:list --project "$PROJECT" --json --non-interactive \
@@ -133,12 +154,16 @@ env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
     -u BLITZ_EXPECTED_LIVE_RELEASE \
     -u BLITZ_RELEASE_BASELINE \
+    -u BLITZ_APPROVED_BASELINE_RECORD \
+    -u BLITZ_APPROVED_BASELINE_RECORD_SHA256 \
     npm test || stop 'npm test failed.'
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
     -u BLITZ_EXPECTED_LIVE_RELEASE \
     -u BLITZ_RELEASE_BASELINE \
+    -u BLITZ_APPROVED_BASELINE_RECORD \
+    -u BLITZ_APPROVED_BASELINE_RECORD_SHA256 \
     npm run verify:bundle || stop 'verify:bundle failed.'
 BLITZ_SECURE_ATTEST_NONCE="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" || stop 'Cannot create the secure suite attestation.'
 [[ "$BLITZ_SECURE_ATTEST_NONCE" =~ ^[0-9a-f]{32}$ ]] || stop 'Cannot create the secure suite attestation.'
@@ -150,6 +175,8 @@ env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
     -u BLITZ_EXPECTED_LIVE_RELEASE \
     -u BLITZ_RELEASE_BASELINE \
+    -u BLITZ_APPROVED_BASELINE_RECORD \
+    -u BLITZ_APPROVED_BASELINE_RECORD_SHA256 \
     npm run test:secure || stop 'test:secure failed.'
 require_suite_attestation || stop 'Secure suite attestation is missing or does not match this run.'
 node scripts/build-secure-shell.mjs --config "${BLITZ_SECURE_CONFIG:-secure-config.local.json}" || stop 'Secure shell build failed.'
@@ -250,6 +277,7 @@ verify_shell_baseline() {
   new_fetch_dir || return 1
   fetch_shell_paths "$fetch_dir" || return 1
   node scripts/secure-release.mjs --verify-baseline-shell "$fetch_dir" || return 1
+  node scripts/secure-release.mjs --verify-baseline-bytes "$BLITZ_APPROVED_BASELINE_RECORD" "$BLITZ_APPROVED_BASELINE_RECORD_SHA256" "$SITE" "$fetch_dir" || return 1
   code="$(http_code "https://${SITE}.web.app/data.enc.json")" || return 1
   [[ "$code" == '404' ]] || return 1
 }
@@ -281,7 +309,9 @@ previous_version_id="$(printf '%s\n' "$previous" | sed -n '3p')"
 validate_release_fields "$previous_release" "$previous_version" "$previous_version_id" || stop 'Invalid rollback source.'
 [[ "$expected_release" == "$previous_release" ]] || stop "Current live release does not equal the explicitly verified ${RELEASE_BASELINE} release. Captured: ${previous_release}"
 if [[ "$RELEASE_BASELINE" == 'shell' ]]; then
-  verify_shell_baseline || stop 'Live Hosting content is not a production secure shell with no public ciphertext.'
+  node scripts/secure-release.mjs --check-baseline-record "$BLITZ_APPROVED_BASELINE_RECORD" "$BLITZ_APPROVED_BASELINE_RECORD_SHA256" "$SITE" "$previous_version" \
+    || stop 'The live version is not the approved baseline version.'
+  verify_shell_baseline || stop 'Live Hosting content is not the approved production secure shell with no public ciphertext.'
 else
   verify_demo_sha || stop 'Cannot verify existing fictional demo.'
 fi
@@ -292,8 +322,9 @@ require_suite_attestation || stop 'Secure suite attestation is missing or does n
 # F3: the rollback target must serve exactly its baseline's files and nothing else.
 write_token
 if [[ "$RELEASE_BASELINE" == 'shell' ]]; then
-  version_files "$previous_version_id" | node scripts/secure-release.mjs --version-files-shell \
-    || stop 'Rollback version is not exactly a secure shell; it is not a trustworthy baseline.'
+  version_files "$previous_version_id" \
+    | node scripts/secure-release.mjs --version-files-record "$BLITZ_APPROVED_BASELINE_RECORD" "$BLITZ_APPROVED_BASELINE_RECORD_SHA256" "$SITE" \
+    || stop 'Rollback version is not exactly the approved secure shell baseline; it is not a trustworthy baseline.'
 else
   version_files "$previous_version_id" | node scripts/secure-release.mjs --version-files-demo \
     || stop 'Rollback version is not exactly the fictional demo; it is not a trustworthy baseline.'
@@ -307,26 +338,48 @@ echo "STEP_C_LIVE_VERSION=${previous_version}"
 echo "STEP_C_ROLLBACK_COMMAND=${rollback_command}"
 echo "STEP_C: deploying one secure SHELL-ONLY release to hosting:${TARGET} in ${PROJECT}"
 deploy_started=1
-firebase deploy --config "${release_root}/firebase.json" --only "hosting:$TARGET" --project "$PROJECT" --non-interactive
+# R1: --json makes the CLI report the one version it created and released.
+deploy_json="$(firebase deploy --config "${release_root}/firebase.json" --only "hosting:$TARGET" --project "$PROJECT" --non-interactive --json)" \
+  || stop 'The Firebase CLI deploy failed.'
+deployed_version="$(printf '%s' "$deploy_json" | node scripts/secure-release.mjs --deploy-version "$SITE")" \
+  || stop 'The Firebase CLI did not report exactly one version on this site.'
+echo "STEP_C_DEPLOYED_VERSION=${deployed_version}"
 
 capture_live || stop 'Deploy returned but the new live Hosting release could not be read back.'
+post_deploy="$captured"
 [[ "$captured" != "$previous" ]] || stop 'Hosting release did not change after deployment.'
 new_release="$(printf '%s\n' "$captured" | sed -n '1p')"
 new_version="$(printf '%s\n' "$captured" | sed -n '2p')"
 new_version_id="$(printf '%s\n' "$captured" | sed -n '3p')"
 validate_release_fields "$new_release" "$new_version" "$new_version_id" || stop 'Post-deploy release was not an exact dedicated-site release.'
 [[ "$new_version_id" != "$previous_version_id" ]] || stop 'Hosting version did not change after deployment.'
+# R1: the live channel must serve the version this run uploaded, not merely
+# a version with the same file names (another deploy could have landed).
+[[ "$new_version" == "$deployed_version" ]] || stop 'The live channel does not serve the version this deploy uploaded.'
 shell_code="$(http_code "https://${SITE}.web.app/")" || stop 'Could not read the private shell HTTP status.'
 [[ "$shell_code" == '200' ]] || stop "Private shell did not return HTTP 200 (got ${shell_code})."
 cipher_code="$(http_code "https://${SITE}.web.app/data.enc.json")" || stop 'Could not read the ciphertext path HTTP status.'
 [[ "$cipher_code" == '404' ]] || stop "Public ciphertext path returned HTTP ${cipher_code}; immediate operator review required."
 node scripts/secure-release.mjs --verify-frozen "$release_root" "$manifest_sha" || stop 'Frozen release changed during deploy.'
 write_token
+# R1: every file's content hash in the uploaded version (the CLI's gzip
+# representation) must equal the frozen manifest's file, not just its path.
 version_files "$new_version_id" | node scripts/secure-release.mjs --version-files "$release_root" "$manifest_sha" \
-  || stop 'Live version file list is not exactly the frozen manifest.'
+  || stop 'Live version files or content hashes are not exactly the frozen manifest.'
 verify_live_release || stop 'Live files, status codes or security headers do not match the frozen release.'
 require_billing_off 'Billing state changed.'
+# R1: nothing may have replaced the verified release while it was checked.
+capture_live || stop 'Could not re-read the live Hosting release after verification.'
+[[ "$captured" == "$post_deploy" ]] || stop 'The live Hosting channel changed after verification.'
+# R2: the record a later shell update needs as its approved rollback baseline.
+record_out="$(node scripts/secure-release.mjs --release-record "$release_root" "$manifest_sha" "$deployed_version" "$SITE")" \
+  || stop 'Could not produce the release record.'
+release_record="$(printf '%s\n' "$record_out" | sed -n '1p')"
+release_record_sha="$(printf '%s\n' "$record_out" | sed -n '2p')"
+[[ -n "$release_record" && "$release_record_sha" =~ ^[0-9a-f]{64}$ ]] || stop 'Could not produce the release record.'
 deploy_verified=1
 echo "STEP_C_DEPLOY_VERIFIED: new release ${new_release}; manifest ${manifest_sha}; exact files, headers and CSP; public ciphertext 404; billing OFF."
 echo "STEP_C_NEW_RELEASE=${new_release}"
+echo "STEP_C_RELEASE_RECORD=${release_record}"
+echo "STEP_C_RELEASE_RECORD_SHA256=${release_record_sha}"
 echo "STEP_C_ROLLBACK_COMMAND=${rollback_command}"

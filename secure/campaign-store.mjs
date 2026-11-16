@@ -24,8 +24,11 @@
 //                                   acknowledgement, failed or mismatched readback)
 //   committed-eligibility-changed  committed and read back, but the owner record
 //                                   changed during the commit (claim race)
-// The transaction runs with maxAttempts 1, so an ambiguous commit is never
-// retried by the SDK or by this tool. The receipt records what to do either way.
+// The transaction runs with maxAttempts 1 (no transaction re-run) and the
+// Firestore client is built with Commit retries disabled at the GAPIC and gRPC
+// layers (R5, secure/operator-clients.mjs), so an ambiguous commit is sent once
+// and never repeated by the SDK or by this tool. The receipt records what to do
+// either way.
 import { createHash } from 'node:crypto';
 import { isEnvelope } from './envelope.mjs';
 

@@ -12,7 +12,9 @@
 // The manifest's own SHA-256 is printed once and held by the wrapper; every
 // later check is bound to it.
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { createReadStream, readFileSync } from 'node:fs';
+import { Readable } from 'node:stream';
+import zlib from 'node:zlib';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -200,10 +202,121 @@ export async function verifyFrozen(root, manifestSha256, { repoRoot = ROOT } = {
   return manifest;
 }
 
+// R1: the Hosting API does not report the SHA-256 of a file's bytes. The
+// Firebase CLI (firebase-tools 14.22.0, lib/deploy/hosting/uploader.js:
+// zipStream + hashHandler) uploads, and names, every file by the SHA-256 of
+// its gzip stream at level 9 (zlib.createGzip({ level: 9 }) over a read
+// stream). This is that representation, computed the same way. Run it under
+// the same Node/zlib as the CLI: a different zlib can compress differently,
+// which fails closed (a mismatch stops the run) rather than open.
+export const HOSTING_GZIP_LEVEL = 9;
+
+export async function hostingFileHash(source) {
+  const input = Buffer.isBuffer(source) ? Readable.from([source]) : createReadStream(source);
+  const chunks = [];
+  for await (const chunk of input.pipe(zlib.createGzip({ level: HOSTING_GZIP_LEVEL }))) chunks.push(chunk);
+  return sha256(Buffer.concat(chunks));
+}
+
+// The Hosting hash of every frozen file, keyed by manifest path, after the
+// frozen copy has been re-verified against its manifest.
+export async function expectedHostingHashes(root, manifestSha256, { repoRoot = ROOT } = {}) {
+  const manifest = await verifyFrozen(root, manifestSha256, { repoRoot });
+  const hashes = new Map();
+  for (const file of manifest.files) hashes.set(file.path, await hostingFileHash(path.join(root, RELEASE_PUBLIC, file.path)));
+  // Re-verify: the bytes hashed above are still the manifest's bytes.
+  await verifyFrozen(root, manifestSha256, { repoRoot });
+  return { manifest, hashes };
+}
+
+// R1: `firebase deploy --json` reports the version it created and released
+// (lib/deploy/index.js: { hosting: <version name> } for one deploy). Exactly
+// one version, on this site, or the run stops.
+export function parseDeployVersion(text, site) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error('firebase deploy --json output was not JSON');
+  }
+  const version = data?.result?.hosting;
+  if (data?.status !== 'success' || typeof version !== 'string') throw new Error('firebase deploy did not report exactly one Hosting version');
+  const match = version.match(/^sites\/([a-z0-9-]{1,63})\/versions\/([A-Za-z0-9_-]{1,128})$/);
+  if (!match || match[1] !== site) throw new Error('firebase deploy reported a version on another site');
+  return version;
+}
+
+// R2: a release record binds one Hosting version to the exact bytes it serves:
+// for every shell file, its size and SHA-256 and its Hosting (gzip) hash. A
+// verified deploy prints its record and the record's SHA-256; once that digest
+// is independently approved, the record is the only acceptable rollback
+// baseline for the next shell update. Canonical JSON plus one newline.
+const VERSION_NAME = /^sites\/([a-z0-9-]{1,63})\/versions\/([A-Za-z0-9_-]{1,128})$/;
+
+export function canonicalReleaseRecord({ site, versionName, files }) {
+  return `${JSON.stringify({
+    version: 1,
+    site,
+    versionName,
+    files: files.map(({ path: p, size, sha256: digest, hostingHash }) => ({ path: p, size, sha256: digest, hostingHash })),
+  })}\n`;
+}
+
+export async function releaseRecord({ root, manifestSha256, versionName, site, repoRoot = ROOT }) {
+  const match = String(versionName).match(VERSION_NAME);
+  if (!match || match[1] !== site) throw new Error('Release record version is not on this site');
+  const { manifest, hashes } = await expectedHostingHashes(root, manifestSha256, { repoRoot });
+  return canonicalReleaseRecord({
+    site,
+    versionName,
+    files: manifest.files.map((file) => ({ ...file, hostingHash: hashes.get(file.path) })),
+  });
+}
+
+export function parseReleaseRecord(text, expectedSha256, site) {
+  if (!DIGEST.test(expectedSha256 || '')) throw new Error('Approved baseline record digest is missing or malformed');
+  if (sha256(Buffer.from(String(text), 'utf8')) !== expectedSha256) throw new Error('Baseline record does not match its approved digest');
+  let record;
+  try {
+    record = JSON.parse(text);
+  } catch {
+    throw new Error('Baseline record is not JSON');
+  }
+  if (record?.version !== 1 || record.site !== site || !Array.isArray(record.files)) throw new Error('Baseline record is not for this site');
+  const match = String(record.versionName).match(VERSION_NAME);
+  if (!match || match[1] !== site) throw new Error('Baseline record version is not on this site');
+  if (canonicalReleaseRecord(record) !== text) throw new Error('Baseline record is not canonical');
+  if (JSON.stringify(record.files.map((f) => f.path)) !== JSON.stringify(SECURE_SHELL_FILES)) throw new Error('Baseline record is not the secure shell file list');
+  for (const file of record.files) {
+    if (!Number.isInteger(file.size) || file.size < 1 || file.size > MAX_FILE_BYTES || !DIGEST.test(file.sha256) || !DIGEST.test(file.hostingHash)) {
+      throw new Error(`Baseline record entry is malformed: ${file.path}`);
+    }
+  }
+  return record;
+}
+
+async function readRecord(file, expectedSha256, site) {
+  return parseReleaseRecord((await readRegular(file)).toString('utf8'), expectedSha256, site);
+}
+
+// Every byte the live baseline serves must be the approved record's (the
+// header/CSP/script checks in verifyBaselineShell still run as well).
+export async function verifyBaselineBytes({ record, fetchDir }) {
+  for (const [index, file] of record.files.entries()) {
+    const body = await fs.readFile(path.join(fetchDir, `${index}.body`));
+    if (body.length !== file.size || sha256(body) !== file.sha256) throw new Error(`Live baseline ${file.path} is not the approved baseline`);
+  }
+  const index = record.files.find((file) => file.path === 'index.html');
+  const root = await fs.readFile(path.join(fetchDir, 'root.body'));
+  if (root.length !== index.size || sha256(root) !== index.sha256) throw new Error('Live baseline / is not the approved baseline');
+  return true;
+}
+
 // GET sites/{site}/versions/{id}/files. One page is all a shell release can have;
 // a continuation token, a duplicate, an unfinished upload or any path outside
-// the expected list fails.
-export function assertVersionFiles(text, expectedPaths) {
+// the expected list fails. With expectedHashes (path -> Hosting hash) every
+// file's content hash must match too (R1).
+export function assertVersionFiles(text, expectedPaths, expectedHashes = null) {
   let data;
   try {
     data = JSON.parse(text);
@@ -229,6 +342,12 @@ export function assertVersionFiles(text, expectedPaths) {
   const missing = wanted.filter((p) => !actual.includes(p));
   if (extra.length) throw new Error(`Hosting version serves files outside the approved list: ${extra.join(', ')}`);
   if (missing.length) throw new Error(`Hosting version is missing approved files: ${missing.join(', ')}`);
+  if (expectedHashes) {
+    for (const file of data.files) {
+      const rel = file.path.slice(1);
+      if (expectedHashes.get(rel) !== file.hash) throw new Error(`Hosting version content differs from the approved release: ${rel}`);
+    }
+  }
   return actual;
 }
 
@@ -360,9 +479,30 @@ async function main(argv) {
     const manifest = await verifyFrozen(rest[0], rest[1]);
     for (const file of manifest.files) console.log(file.path);
   } else if (mode === '--version-files') {
-    const manifest = await verifyFrozen(rest[0], rest[1]);
-    assertVersionFiles(readFileSync(0, 'utf8'), manifest.files.map((file) => file.path));
-    console.log('PASS: live version serves exactly the frozen file list');
+    // R1: paths and every content hash, in the CLI's gzip representation.
+    const { manifest, hashes } = await expectedHostingHashes(rest[0], rest[1]);
+    assertVersionFiles(readFileSync(0, 'utf8'), manifest.files.map((file) => file.path), hashes);
+    console.log('PASS: live version serves exactly the frozen files, byte for byte');
+  } else if (mode === '--release-record') {
+    // <root> <manifest sha> <version name> <site>: prints the record, then its SHA-256.
+    const text = await releaseRecord({ root: rest[0], manifestSha256: rest[1], versionName: rest[2], site: rest[3] });
+    process.stdout.write(`${text.trimEnd()}\n${sha256(Buffer.from(text, 'utf8'))}\n`);
+  } else if (mode === '--check-baseline-record') {
+    // <record file> <approved sha> <site> [<live version name>]
+    const record = await readRecord(rest[0], rest[1], rest[2]);
+    if (rest[3] !== undefined && record.versionName !== rest[3]) throw new Error('The live version is not the approved baseline version');
+    console.log('PASS: approved baseline record');
+  } else if (mode === '--version-files-record') {
+    // R2: the rollback version must list the approved record's files and content hashes.
+    const record = await readRecord(rest[0], rest[1], rest[2]);
+    const hashes = new Map(record.files.map((file) => [file.path, file.hostingHash]));
+    assertVersionFiles(readFileSync(0, 'utf8'), record.files.map((file) => file.path), hashes);
+    console.log('PASS: rollback version serves exactly the approved baseline');
+  } else if (mode === '--verify-baseline-bytes') {
+    await verifyBaselineBytes({ record: await readRecord(rest[0], rest[1], rest[2]), fetchDir: rest[3] });
+    console.log('PASS: live baseline bytes are the approved baseline');
+  } else if (mode === '--deploy-version') {
+    process.stdout.write(`${parseDeployVersion(readFileSync(0, 'utf8'), rest[0])}\n`);
   } else if (mode === '--version-files-demo') {
     // The rollback target for the demo baseline must be exactly the fictional demo build.
     assertVersionFiles(readFileSync(0, 'utf8'), DEMO_HOSTING_FILES);
@@ -382,7 +522,7 @@ async function main(argv) {
   } else if (mode === '--remove') {
     await removeRelease(rest[0]);
   } else {
-    throw new Error('Use --freeze, --verify-frozen, --paths, --shell-paths, --version-files, --version-files-demo, --version-files-shell, --verify-live, --verify-baseline-shell or --remove');
+    throw new Error('Use --freeze, --verify-frozen, --paths, --shell-paths, --version-files, --deploy-version, --release-record, --check-baseline-record, --version-files-record, --verify-baseline-bytes, --version-files-demo, --version-files-shell, --verify-live, --verify-baseline-shell or --remove');
   }
 }
 

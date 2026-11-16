@@ -188,7 +188,7 @@ test('release cli prints only the clone id and drops account identifiers', () =>
 test('secure deploy script can target only hosting:blitz and prints an exact clone rollback', () => {
   assert.equal(spawnSync('bash', ['-n', 'scripts/deploy-secure-blitz.sh'], { encoding: 'utf8', env: cleanChildEnv() }).status, 0);
   assert.deepEqual(scriptCode.match(/firebase deploy[^\n]*/g), [
-    'firebase deploy --config "${release_root}/firebase.json" --only "hosting:$TARGET" --project "$PROJECT" --non-interactive',
+    'firebase deploy --config "${release_root}/firebase.json" --only "hosting:$TARGET" --project "$PROJECT" --non-interactive --json)" \\',
   ]);
   assert.deepEqual(scriptCode.match(/firebase hosting:clone[^\n]*/g), [
     'firebase hosting:clone --project ${PROJECT} --non-interactive ${SITE}@${previous_version_id} ${SITE}:live"',
@@ -203,7 +203,7 @@ test('secure deploy script can target only hosting:blitz and prints an exact clo
   assert.match(scriptCode, /-H @"\$token_file"/);
   assert.match(scriptCode, /Concurrent Hosting change detected/);
   assert.match(scriptCode, /deploy_verified=1/);
-  const isolated = 'env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \\\n    -u BLITZ_APPROVED_COMMIT \\\n    -u BLITZ_EXPECTED_DEMO_RELEASE \\\n    -u BLITZ_EXPECTED_LIVE_RELEASE \\\n    -u BLITZ_RELEASE_BASELINE \\\n    ';
+  const isolated = 'env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \\\n    -u BLITZ_APPROVED_COMMIT \\\n    -u BLITZ_EXPECTED_DEMO_RELEASE \\\n    -u BLITZ_EXPECTED_LIVE_RELEASE \\\n    -u BLITZ_RELEASE_BASELINE \\\n    -u BLITZ_APPROVED_BASELINE_RECORD \\\n    -u BLITZ_APPROVED_BASELINE_RECORD_SHA256 \\\n    ';
   for (const [command, message] of [
     ['npm test', 'npm test failed.'],
     ['npm run verify:bundle', 'verify:bundle failed.'],

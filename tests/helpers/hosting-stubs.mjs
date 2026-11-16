@@ -24,9 +24,23 @@
 //   cipher-live           shell baseline, but /data.enc.json is still served
 //   wrong-release         the operator-supplied release is not the live one
 //   demo-baseline-shell-live  demo baseline requested while a shell is live
+//   live-not-deployed     R1: after the deploy the channel serves another version
+//                         with the same files (a concurrent deploy), not ours
+//   version-hash-stale    R1: the new version lists the right paths but one file's
+//                         content hash is not the frozen file's
+//   drift-after-verify    R1: the channel changes once the release has been checked
+//   baseline-arbitrary-js R2: the live shell (and its version) serve a shell.js that
+//                         passes every structural check but is not the approved one
+//   baseline-version-hash R2: the rollback version's Hosting hash for shell.js is not
+//                         the approved record's, although the served bytes are
+//   baseline-record-other-version  R2: the approved record names another version
+// Shell-baseline runs get an approved release record of the pre-deploy shell
+// (BLITZ_APPROVED_BASELINE_RECORD[_SHA256]) unless record: false.
+// Version file hashes are the CLI's representation: SHA-256 of gzip level 9.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { gzipSync } from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +53,8 @@ export const releaseBefore = `sites/${site}/channels/live/releases/1794426642121
 export const releaseAfter = `sites/${site}/channels/live/releases/1794999999999000`;
 export const versionBefore = 'beforeversion01';
 export const versionAfter = 'afterversion002';
+export const releaseOther = `sites/${site}/channels/live/releases/1794999999999555`;
+export const versionOther = 'otherversion03';
 export const FICTIONAL_EXPORT = '{"contacts":[{"contact":"Example Plaintext Export","account":"EXAMPLE Leak Co"}]}\n';
 
 export function webConfig(apiKey = 'AIzaSyDUMMYPUBLICWEBCONFIGKEY000000000') {
@@ -113,6 +129,7 @@ copy(pub, out);
 fs.writeFileSync(path.join(env.STUB_STATE, 'deployed-config'), configFile);
 fs.appendFileSync(env.STUB_FIREBASE_LOG, 'DEPLOY\\n');
 fs.writeFileSync(path.join(env.STUB_STATE, 'deployed'), '', { flag: 'a' });
+if (args.includes('--json')) process.stdout.write(JSON.stringify({ status: 'success', result: { hosting: 'sites/${site}/versions/${versionAfter}' } }, null, 2) + '\\n');
 `;
 
 const GCLOUD_STUB = `
@@ -148,7 +165,7 @@ process.stdout.write('False\\n');
 
 const NPM_STUB = `#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_NPM_LOG"
-for name in BLITZ_APPROVE_SECURE_SHELL_DEPLOY BLITZ_APPROVED_COMMIT BLITZ_EXPECTED_DEMO_RELEASE BLITZ_EXPECTED_LIVE_RELEASE BLITZ_RELEASE_BASELINE; do
+for name in BLITZ_APPROVE_SECURE_SHELL_DEPLOY BLITZ_APPROVED_COMMIT BLITZ_EXPECTED_DEMO_RELEASE BLITZ_EXPECTED_LIVE_RELEASE BLITZ_RELEASE_BASELINE BLITZ_APPROVED_BASELINE_RECORD BLITZ_APPROVED_BASELINE_RECORD_SHA256; do
   if env | grep -q "^$name="; then printf '%s\\n' "APPROVAL_VAR_PRESENT $name" >> "$STUB_NPM_LOG"; fi
 done
 if [ "$1" = run ] && [ "$2" = test:secure ]; then
@@ -209,13 +226,31 @@ function list(dir, rel) {
 }
 const SHELL = JSON.parse(env.STUB_SHELL_FILES);
 const DEMO = JSON.parse(env.STUB_DEMO_FILES);
-function versionEntry(p) { return { path: '/' + p, hash: crypto.createHash('sha256').update(p).digest('hex'), status: 'ACTIVE' }; }
+const zlib = require('node:zlib');
+// The Hosting API's hash: SHA-256 of the CLI's gzip (level 9) of the file.
+function hostingHash(buf) { return crypto.createHash('sha256').update(zlib.gzipSync(buf, { level: 9 })).digest('hex'); }
+function versionEntry(p, dir, tweak) {
+  const file = dir ? path.join(dir, p) : null;
+  let buf = file && fs.existsSync(file) ? fs.readFileSync(file) : Buffer.from('missing:' + p);
+  if (tweak && tweak(p)) buf = Buffer.concat([buf, Buffer.from('\\n// stale upload\\n')]);
+  return { path: '/' + p, hash: hostingHash(buf), status: 'ACTIVE' };
+}
+let postReads = 0;
+if (deployed && url === api + '/channels/live') {
+  const counter = path.join(env.STUB_STATE, 'post-deploy-channel-reads');
+  postReads = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0) + 1;
+  fs.writeFileSync(counter, String(postReads));
+}
 if (url === api + '/channels/live') {
   if (!authed()) status = 401;
   else {
     status = 200;
-    const release = deployed ? '${releaseAfter}' : '${releaseBefore}';
-    const version = deployed ? '${versionAfter}' : '${versionBefore}';
+    let release = deployed ? '${releaseAfter}' : '${releaseBefore}';
+    let version = deployed ? '${versionAfter}' : '${versionBefore}';
+    if (deployed && (mode === 'live-not-deployed' || (mode === 'drift-after-verify' && postReads >= 2))) {
+      release = '${releaseOther}';
+      version = '${versionOther}';
+    }
     body = Buffer.from(JSON.stringify({ name: 'sites/' + SITE + '/channels/live', url: origin, release: { name: release, type: 'DEPLOY', version: { name: 'sites/' + SITE + '/versions/' + version, status: 'FINALIZED' } } }));
   }
 } else if (url === api + '/versions/${versionBefore}/files') {
@@ -224,15 +259,19 @@ if (url === api + '/channels/live') {
     status = 200;
     const names = [...(baseline === 'shell' ? SHELL : DEMO)];
     if (mode === 'rollback-extra') names.push('campaign-export.json');
-    body = Buffer.from(JSON.stringify({ files: names.map(versionEntry) }));
+    const dir = baseline === 'shell' ? env.STUB_PRE_DIR : env.STUB_DEMO_DIR;
+    const stale = mode === 'baseline-version-hash' ? (n) => n === 'shell.js' : null;
+    body = Buffer.from(JSON.stringify({ files: names.map((n) => versionEntry(n, dir, stale)) }));
   }
-} else if (url === api + '/versions/${versionAfter}/files') {
+} else if (url === api + '/versions/${versionAfter}/files' || url === api + '/versions/${versionOther}/files') {
   if (!authed() || !deployed) status = 401;
   else {
     status = 200;
-    const names = list(path.join(env.STUB_STATE, 'live-files'), '');
+    const live = path.join(env.STUB_STATE, 'live-files');
+    const names = list(live, '');
     if (mode === 'version-extra') names.push('campaign-export.json');
-    body = Buffer.from(JSON.stringify({ files: names.map(versionEntry) }));
+    const stale = mode === 'version-hash-stale' ? (n) => n === 'shell.js' : null;
+    body = Buffer.from(JSON.stringify({ files: names.map((n) => versionEntry(n, live, stale)) }));
   }
 } else if (url && url.startsWith(origin + '/')) {
   const name = url === origin + '/' ? 'index.html' : decodeURIComponent(url.slice(origin.length + 1));
@@ -271,7 +310,20 @@ if (writeOut === '%{http_code}') process.stdout.write(String(status));
 // Copies the repository pieces the script needs. For the demo baseline the copy's
 // DEMO_SHA is pointed at a synthetic demo ciphertext; the real value pins a
 // historical build whose bytes are not reproducible.
-export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell } = {}) {
+// R2: the approved record of a shell directory served as `versionName`, built
+// independently of scripts/secure-release.mjs (same canonical form).
+export async function shellRecord(dir, versionName, files) {
+  const sha = (b) => createHash('sha256').update(b).digest('hex');
+  const entries = [];
+  for (const rel of files) {
+    const bytes = await readFile(path.join(dir, rel));
+    entries.push({ path: rel, size: bytes.length, sha256: sha(bytes), hostingHash: sha(gzipSync(bytes, { level: 9 })) });
+  }
+  const text = `${JSON.stringify({ version: 1, site, versionName, files: entries })}\n`;
+  return { text, sha256: sha(Buffer.from(text, 'utf8')) };
+}
+
+export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell, record = true } = {}) {
   const work = await mkdtemp(path.join(os.tmpdir(), 'blitz-release-harness-'));
   const repo = path.join(work, 'repo');
   const bin = path.join(work, 'bin');
@@ -298,6 +350,17 @@ export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell } =
     // What is live before the deploy, independent of what the operator asked for.
     const preIsShell = baseline === 'shell' || mode === 'demo-baseline-shell-live';
     const preDir = preIsShell ? await buildShell(work, 'AIzaSyPREVIOUSLIVESHELLKEY0000000000000') : demoDir;
+    let approvedRecord = null;
+    if (preIsShell && baseline === 'shell' && record) {
+      const { SECURE_SHELL_FILES: files } = await import('../../scripts/verify-secure-shell.mjs');
+      const named = mode === 'baseline-record-other-version' ? 'approvedother01' : versionBefore;
+      approvedRecord = await shellRecord(preDir, `sites/${site}/versions/${named}`, files);
+      approvedRecord.file = path.join(work, 'approved-baseline-record.json');
+      await writeFile(approvedRecord.file, approvedRecord.text);
+      // After approval, the live shell.js is replaced by one that passes every
+      // structural check (no ciphertext reference, same page and config).
+      if (mode === 'baseline-arbitrary-js') await appendFile(path.join(preDir, 'shell.js'), '\n;globalThis.__unapproved = 1;\n');
+    }
     const sites = path.join(work, 'sites.json');
     await writeFile(sites, JSON.stringify({
       status: 'success',
@@ -339,6 +402,10 @@ export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell } =
     } else {
       env.BLITZ_RELEASE_BASELINE = 'shell';
       env.BLITZ_EXPECTED_LIVE_RELEASE = mode === 'wrong-release' ? `sites/${site}/channels/live/releases/1` : releaseBefore;
+      if (approvedRecord) {
+        env.BLITZ_APPROVED_BASELINE_RECORD = approvedRecord.file;
+        env.BLITZ_APPROVED_BASELINE_RECORD_SHA256 = approvedRecord.sha256;
+      }
     }
     const result = spawnSync('bash', [path.join(repo, 'scripts', 'deploy-secure-blitz.sh')], {
       cwd: repo, encoding: 'utf8', timeout: 240000, env,
