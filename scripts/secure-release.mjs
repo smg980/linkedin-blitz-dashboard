@@ -20,7 +20,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { productionCsp } from '../secure/csp.mjs';
-import { DEMO_HOSTING_FILES } from './build-firebase-demo.mjs';
 import { assertPrivateWebConfig, assertSecureTarget } from './secure-hosting-guard.mjs';
 import { SECURE_SHELL_FILES, verifySecureShell } from './verify-secure-shell.mjs';
 
@@ -504,9 +503,9 @@ async function main(argv) {
   } else if (mode === '--deploy-version') {
     process.stdout.write(`${parseDeployVersion(readFileSync(0, 'utf8'), rest[0])}\n`);
   } else if (mode === '--version-files-demo') {
-    // The rollback target for the demo baseline must be exactly the fictional demo build.
-    assertVersionFiles(readFileSync(0, 'utf8'), DEMO_HOSTING_FILES);
-    console.log('PASS: rollback version serves exactly the fictional demo file list');
+    // R2: the demo rollback baseline is disabled. A file list (and a single
+    // ciphertext digest) does not authenticate the demo's executable assets.
+    throw new Error('The demo rollback baseline is disabled');
   } else if (mode === '--version-files-shell') {
     // The rollback target for the shell baseline must be exactly a secure shell build.
     assertVersionFiles(readFileSync(0, 'utf8'), SECURE_SHELL_FILES);
@@ -522,7 +521,7 @@ async function main(argv) {
   } else if (mode === '--remove') {
     await removeRelease(rest[0]);
   } else {
-    throw new Error('Use --freeze, --verify-frozen, --paths, --shell-paths, --version-files, --deploy-version, --release-record, --check-baseline-record, --version-files-record, --verify-baseline-bytes, --version-files-demo, --version-files-shell, --verify-live, --verify-baseline-shell or --remove');
+    throw new Error('Use --freeze, --verify-frozen, --paths, --shell-paths, --version-files, --deploy-version, --release-record, --check-baseline-record, --version-files-record, --verify-baseline-bytes, --version-files-shell, --verify-live, --verify-baseline-shell or --remove');
   }
 }
 

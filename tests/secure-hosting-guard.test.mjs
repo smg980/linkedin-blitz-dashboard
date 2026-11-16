@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertSecureTarget, assertPrivateWebConfig, currentLiveRelease } from '../scripts/secure-hosting-guard.mjs';
+import { writeSyntheticBaselineRecord } from './helpers/hosting-stubs.mjs';
 
 const site = 'master-intelligence-5496f-lb';
 const project = 'master-intelligence-5496f';
@@ -199,7 +200,9 @@ test('secure deploy script can target only hosting:blitz and prints an exact clo
   assert.doesNotMatch(scriptCode, /master-intelligence-5496f-app|master-intelligence-5496f-prep|hosting:app|hosting:prep/);
   assert.doesNotMatch(scriptCode, /\|\|\s*firebase|echo[^\n]*\$token|read -s|DASHBOARD_PASSPHRASE=/);
   assert.match(scriptCode, /BLITZ_APPROVE_SECURE_SHELL_DEPLOY/);
-  assert.match(scriptCode, /cf657dfeadc74bc5091f1dce72f68ba83754677234760c3182920ff088fccccd/);
+  // R2: the demo baseline (and its single-ciphertext digest) is gone.
+  assert.doesNotMatch(scriptCode, /cf657dfeadc74bc5091f1dce72f68ba83754677234760c3182920ff088fccccd|DEMO_SHA|verify_demo_sha|--version-files-demo/);
+  assert.match(scriptCode, /RELEASE_BASELINE="\$\{BLITZ_RELEASE_BASELINE:-\}"/);
   assert.match(scriptCode, /-H @"\$token_file"/);
   assert.match(scriptCode, /Concurrent Hosting change detected/);
   assert.match(scriptCode, /deploy_verified=1/);
@@ -222,7 +225,7 @@ test('secure deploy script can target only hosting:blitz and prints an exact clo
   assert.ok(lastShellCheck > 0 && freezeAt > lastShellCheck && freezeAt < deployAt);
   assert.ok(scriptCode.indexOf("--verify-frozen \"$release_root\" \"$manifest_sha\" || stop 'Frozen release changed before deploy.'") < deployAt);
   assert.ok(scriptCode.indexOf("--verify-frozen \"$release_root\" \"$manifest_sha\" || stop 'Frozen release changed during deploy.'") > deployAt);
-  assert.ok(scriptCode.indexOf('--version-files-demo') < deployAt, 'rollback target checked before deploy');
+  assert.ok(scriptCode.indexOf('--version-files-record') > 0 && scriptCode.indexOf('--version-files-record') < deployAt, 'rollback target checked before deploy');
   assert.ok(scriptCode.indexOf('--version-files "$release_root" "$manifest_sha"') > deployAt);
   assert.ok(scriptCode.indexOf("verify_live_release || stop") > deployAt);
   assert.ok(scriptCode.indexOf("verify_live_release || stop") < scriptCode.indexOf('deploy_verified=1'));
@@ -246,7 +249,7 @@ function assertDeployRefusals(base) {
   assert.notEqual(passphrase.status, 0);
   assert.match(passphrase.stderr, /No campaign passphrase/);
   assert.doesNotMatch(`${passphrase.stdout}\n${passphrase.stderr}`, new RegExp(secret));
-  const wrong = runDeploy({ BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES', BLITZ_APPROVED_COMMIT: '0000000000000000000000000000000000000000' }, base);
+  const wrong = runDeploy({ BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES', BLITZ_RELEASE_BASELINE: 'shell', BLITZ_APPROVED_COMMIT: '0000000000000000000000000000000000000000' }, base);
   assert.notEqual(wrong.status, 0);
   assert.match(wrong.stderr, /not the approved commit/);
   assert.doesNotMatch(`${wrong.stdout}\n${wrong.stderr}`, /STEP_C: deploying|firebase deploy --config/);
@@ -296,6 +299,7 @@ async function deployStopsBeforeFirebase(mode, { signal = '' } = {}) {
   const config = path.join(dir, 'secure-config.json');
   const killed = path.join(dir, 'killed-gate.mjs');
   const approved = '1111111111111111111111111111111111111111';
+  const baselineRecord = await writeSyntheticBaselineRecord(dir);
   await writeFile(config, '{}\n');
   await writeFile(firebaseLog, '');
   await writeFile(npmLog, '');
@@ -426,7 +430,11 @@ exit 0
   const env = cleanChildEnv({
     BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES',
     BLITZ_APPROVED_COMMIT: approved,
-    BLITZ_EXPECTED_DEMO_RELEASE: 'sites/x/channels/live/releases/1',
+    // R2: only the shell baseline reaches the test gates; its record is fictional.
+    BLITZ_RELEASE_BASELINE: 'shell',
+    BLITZ_EXPECTED_LIVE_RELEASE: 'sites/master-intelligence-5496f-lb/channels/live/releases/1',
+    BLITZ_APPROVED_BASELINE_RECORD: baselineRecord.file,
+    BLITZ_APPROVED_BASELINE_RECORD_SHA256: baselineRecord.sha256,
     BLITZ_SECURE_CONFIG: config,
     PATH: `${bin}:${process.env.PATH}`,
     SECURE_GATE_MODE: mode,
