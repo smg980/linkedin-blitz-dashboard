@@ -8,7 +8,6 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { refreshToken } from 'firebase-admin/app';
 import { encryptEnvelope } from '../secure/envelope.mjs';
 import { isCredentialEnvKey, PRODUCTION_PROJECT, StoreRefusal } from '../secure/campaign-store.mjs';
 import { acquireOperatorLock } from '../secure/operator-lock.mjs';
@@ -149,8 +148,8 @@ test('F4: production runs bind the checked credential before any SDK call and pr
     const args = ['inspect', '--target', 'production', '--project', PRODUCTION_PROJECT];
     assert.equal(await refusalCode(main(args, env, deps)), 'STORE_ADC_IDENTITY_MISMATCH');
     assert.deepEqual(seen, [['load', PRODUCTION_PROJECT], ['bind', 'function']]);
-    // The checked file is what the SDK would receive: a refresh-token credential.
-    assert.equal(typeof refreshToken(USER_ADC).getAccessToken, 'function');
+    // R3: client construction from the checked file is proven end to end in
+    // tests/operator-clients.test.mjs; a shape check here proved nothing.
     // A refused production run leaves no lock behind.
     const lock = await acquireOperatorLock({ project: PRODUCTION_PROJECT, purpose: 'test', dir: lockDir });
     await lock.release();

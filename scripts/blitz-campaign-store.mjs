@@ -286,22 +286,28 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
   }
   let app;
   let deleteApp;
+  let firestore;
   try {
     const admin = await import('firebase-admin/app');
     deleteApp = admin.deleteApp;
-    const { getFirestore } = await import('firebase-admin/firestore');
     const { getAuth } = await import('firebase-admin/auth');
+    const { createEmulatorFirestore, createOperatorClients } = await import('../secure/operator-clients.mjs');
     let appOptions = { projectId: opts.project };
     if (opts.target === 'production') {
       // F4: one explicit, checked user credential. The SDK never searches for ADC.
+      // R3: built as a refresh client both pinned SDKs accept (see operator-clients.mjs).
       const adc = await (deps.loadOperatorCredential || loadOperatorCredential)({ env, projectId: opts.project });
-      const credential = admin.refreshToken(adc);
-      await (deps.bindOperatorIdentity || bindOperatorIdentity)({ credential });
-      appOptions = { projectId: opts.project, credential };
+      const clients = createOperatorClients({ adc, projectId: opts.project, testTransport: deps.testTransport });
+      firestore = clients.firestore;
+      await (deps.bindOperatorIdentity || bindOperatorIdentity)({ credential: clients.credential });
+      appOptions = { projectId: opts.project, credential: clients.credential };
+      if (deps.testTransport?.httpAgent) appOptions.httpAgent = deps.testTransport.httpAgent;
+    } else {
+      firestore = createEmulatorFirestore({ projectId: opts.project });
     }
     app = admin.initializeApp(appOptions, `blitz-store-${process.pid}-${Date.now()}`);
     const result = await runStoreAction({
-      db: getFirestore(app),
+      db: firestore,
       auth: getAuth(app),
       backup: { write: writeBackupFile },
       receipt: { create: createReceiptFile, update: updateReceiptFile },
@@ -328,6 +334,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
     if (error instanceof StoreRefusal) throw error;
     throw new StoreRefusal('STORE_OPERATION_FAILED');
   } finally {
+    if (firestore) await Promise.race([firestore.terminate(), new Promise((resolve) => setTimeout(resolve, 3000))]);
     if (app) await Promise.race([deleteApp(app), new Promise((resolve) => setTimeout(resolve, 3000))]);
     if (lock) await lock.release();
   }
