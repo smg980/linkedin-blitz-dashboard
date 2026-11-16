@@ -79,6 +79,57 @@ test('state machine and lock wipe drop plaintext', () => {
   assert.throws(() => createSession().unlocked(null), /requires plaintext/);
 });
 
+test('unlock tickets settle only under the epoch and envelope they started with', () => {
+  const secret = { contacts: [{ contact: 'Example Ada' }] };
+  const envelopeA = { v: 1, id: 'a' };
+  const envelopeB = { v: 1, id: 'b' };
+  const session = createSession();
+  assert.throws(() => session.beginUnlock(), /locked session/);
+  session.signInStart();
+  session.locked(envelopeA);
+
+  // Sign-out, lock, a new envelope, a new sign-in and a denial each invalidate.
+  const invalidators = [
+    (s) => s.signOut(),
+    (s) => s.lock(),
+    (s) => s.locked(envelopeB),
+    (s) => s.signInStart(),
+    (s) => s.notAuthorized('denied'),
+  ];
+  for (const invalidate of invalidators) {
+    const local = createSession();
+    local.signInStart();
+    local.locked(envelopeA);
+    const ticket = local.beginUnlock({ uid: 'owner', generation: 1 });
+    assert.equal(local.unlockPending(), true);
+    const before = local.epoch();
+    invalidate(local);
+    assert.ok(local.epoch() > before);
+    assert.equal(local.unlockPending(), false);
+    const stateAfter = local.state();
+    assert.equal(local.finishUnlock(ticket, secret), false);
+    assert.equal(local.failUnlock(ticket), false);
+    assert.equal(local.state(), stateAfter);
+    assert.equal(local.plaintext(), null);
+  }
+
+  const first = session.beginUnlock({ uid: 'owner', generation: 7 });
+  assert.equal(first.uid, 'owner');
+  assert.equal(first.generation, 7);
+  assert.equal(first.envelope, envelopeA);
+  assert.ok(Object.isFrozen(first));
+  assert.throws(() => session.beginUnlock(), /already pending/);
+  assert.equal(session.failUnlock(first), true);
+  assert.equal(session.state(), 'wrong-passphrase');
+  assert.equal(session.failUnlock(first), false, 'a settled ticket cannot settle twice');
+  const second = session.beginUnlock({ uid: 'owner', generation: 7 });
+  assert.equal(session.finishUnlock(first, secret), false, 'an earlier ticket cannot settle a later attempt');
+  assert.equal(session.finishUnlock(second, secret), true);
+  assert.equal(session.state(), 'unlocked');
+  assert.equal(session.plaintext(), secret);
+  assert.throws(() => session.beginUnlock(), /locked session/);
+});
+
 test('private document reads are a single get', async () => {
   const calls = [];
   const denied = await readPrivateDocument({

@@ -42,6 +42,7 @@ jobs:
           node --check tests/firebase-deploy.test.mjs
           node --check tests/mobile-layout.test.mjs
           node --check tests/secure-shell.test.mjs
+          node --check tests/secure-unlock-race.test.mjs
           node --check secure/shell.js
           node --check secure/envelope.mjs
           node --check secure/session.mjs
