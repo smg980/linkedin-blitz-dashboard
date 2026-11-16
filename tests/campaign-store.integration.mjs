@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { envelopeDigest } from '../secure/campaign-store.mjs';
+import { envelopeDigest, isCredentialEnvKey } from '../secure/campaign-store.mjs';
 import { decryptEnvelope, encryptEnvelope } from '../secure/envelope.mjs';
 import { readPrivateDocument } from '../secure/firestore-get.mjs';
 import { syntheticPayload } from '../secure/synthetic-contacts.mjs';
@@ -52,12 +52,19 @@ async function signInGoogle(email, sub) {
   return { uid: body.localId, idToken: body.idToken, email };
 }
 
+let receipts = 0;
 function store(args, { uid, confirmUid, approval } = {}) {
   const env = { ...process.env };
+  const lockDir = env.BLITZ_OPERATOR_LOCK_DIR;
   for (const key of Object.keys(env)) {
-    if (/^BLITZ_|PASSPHRASE|^GOOGLE_APPLICATION_CREDENTIALS$|^FIREBASE_TOKEN$|^CI$|^GITHUB_ACTIONS$/.test(key)) delete env[key];
+    if (/^BLITZ_|PASSPHRASE|^CI$|^GITHUB_ACTIONS$/.test(key) || isCredentialEnvKey(key)) delete env[key];
   }
-  Object.assign(env, { FIRESTORE_EMULATOR_HOST: firestoreHost, FIREBASE_AUTH_EMULATOR_HOST: authHost });
+  Object.assign(env, { FIRESTORE_EMULATOR_HOST: firestoreHost, FIREBASE_AUTH_EMULATOR_HOST: authHost, BLITZ_OPERATOR_LOCK_DIR: lockDir });
+  // Every apply needs its own private receipt (F6).
+  if (args.includes('--apply')) {
+    receipts += 1;
+    args = [...args, '--receipt', path.join(dir, `receipt-${receipts}.json`)];
+  }
   if (uid) env.BLITZ_STORE_UID = uid;
   if (confirmUid) env.BLITZ_STORE_CONFIRM_UID = confirmUid;
   if (approval) env.BLITZ_STORE_APPROVAL = approval;
@@ -120,7 +127,11 @@ describe('Step D campaign store on emulators', { concurrency: false }, () => {
     assert.equal(written.status, 0, written.refusal);
     assert.equal(written.json.verified, true);
     assert.equal(written.json.liveDigest, digests.a);
-    assert.deepEqual(written.json.rollback, { action: 'retract', expectCurrent: digests.a, approval: `RETRACT:${digests.a}` });
+    assert.equal(written.json.outcome, 'committed-verified');
+    assert.deepEqual(written.json.rollback, { action: 'retract', expectCurrent: digests.a, approval: `RETRACT:${digests.a}`, backupRequired: true });
+    const receipt = JSON.parse(await fs.readFile(path.join(dir, `receipt-${receipts}.json`), 'utf8'));
+    assert.equal(receipt.status, 'COMMITTED_VERIFIED');
+    assert.equal((await fs.stat(path.join(dir, `receipt-${receipts}.json`))).mode & 0o777, 0o600);
 
     const read = await clientRead(users.owner);
     assert.equal(read.status, 'ok');

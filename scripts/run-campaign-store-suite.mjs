@@ -11,6 +11,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createTracker, installShutdown, launcherSource, TEST_RULES, watchChild } from './run-secure-suite.mjs';
+import { isCredentialEnvKey } from '../secure/campaign-store.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'demo-blitz-store';
@@ -84,8 +85,10 @@ async function main() {
     }));
     const env = { ...process.env };
     for (const key of Object.keys(env)) {
-      if (/PASSPHRASE|^GOOGLE_APPLICATION_CREDENTIALS$|^FIREBASE_TOKEN$|^BLITZ_STORE_/.test(key)) delete env[key];
+      if (/PASSPHRASE|^BLITZ_STORE_|^BLITZ_OPERATOR_LOCK_DIR$/.test(key) || isCredentialEnvKey(key)) delete env[key];
     }
+    // A private, per-run operator lock directory: never the operator's real one.
+    env.BLITZ_OPERATOR_LOCK_DIR = path.join(tmp, 'operator-lock');
     const child = spawn(path.join(ROOT, 'node_modules', '.bin', 'firebase'), [
       '--non-interactive', '--project', PROJECT, 'emulators:exec', '--only', 'auth,firestore',
       '--config', configPath, `${shellQuote(process.execPath)} ${shellQuote(launcherPath)}`,

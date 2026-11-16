@@ -12,6 +12,7 @@ import {
   assertNotPublicBundle,
   assertTarget,
   campaignPath,
+  isCredentialEnvKey,
   canonicalEnvelope,
   envelopeDigest,
   ownerEligibility,
@@ -149,7 +150,7 @@ test('plans are dry runs; apply needs exact uid, digest-bound approval, CAS valu
   const dry = planStoreAction({ ...base, action: 'write', current: null, input: envA });
   assert.equal(dry.requiredApproval, `WRITE:${digestA}`);
   assert.equal(dry.requiredExpectCurrent, 'none');
-  const good = { ...base, action: 'write', current: null, input: envA, apply: true, confirmUid: UID, approval: `WRITE:${digestA}`, expectCurrent: 'none' };
+  const good = { ...base, action: 'write', current: null, input: envA, apply: true, confirmUid: UID, approval: `WRITE:${digestA}`, expectCurrent: 'none', receiptPath: '/private/r.json' };
   assert.equal(planStoreAction(good).inputDigest, digestA);
   const refusals = [
     [{ confirmUid: undefined }, 'STORE_EXACT_UID_CONFIRMATION_REQUIRED'],
@@ -168,6 +169,8 @@ test('plans are dry runs; apply needs exact uid, digest-bound approval, CAS valu
     [{ uid: '../x', confirmUid: '../x' }, 'STORE_INVALID_UID'],
     [{ action: 'delete' }, 'STORE_INVALID_ACTION'],
     [{ apply: 'yes' }, 'STORE_INVALID_APPLY'],
+    [{ receiptPath: undefined }, 'STORE_RECEIPT_REQUIRED'],
+    [{ receiptPath: '' }, 'STORE_RECEIPT_REQUIRED'],
   ];
   for (const [overrides, code] of refusals) {
     assert.throws(() => planStoreAction({ ...good, ...overrides }), { code }, JSON.stringify(overrides));
@@ -179,16 +182,28 @@ test('plans are dry runs; apply needs exact uid, digest-bound approval, CAS valu
   assert.throws(() => planStoreAction({ ...replace, expectCurrent: 'none' }), { code: 'STORE_CURRENT_MISMATCH' });
   assert.throws(() => planStoreAction({ ...replace, input: envA, approval: `WRITE:${digestA}` }), { code: 'STORE_ALREADY_CURRENT' });
   // Retract is allowed for a revoked owner but still needs approval, CAS and backup.
-  const retract = { ...base, action: 'retract', current: envA, apply: true, confirmUid: UID, approval: `RETRACT:${digestA}`, expectCurrent: digestA, backupPath: '/tmp/b.json', user: owner({ customClaims: {}, disabled: true }) };
+  const retract = { ...base, action: 'retract', current: envA, apply: true, confirmUid: UID, approval: `RETRACT:${digestA}`, expectCurrent: digestA, backupPath: '/tmp/b.json', receiptPath: '/private/r.json', user: owner({ customClaims: {}, disabled: true }) };
   assert.equal(planStoreAction(retract).requiredApproval, `RETRACT:${digestA}`);
   assert.throws(() => planStoreAction({ ...retract, current: null, expectCurrent: 'none' }), { code: 'STORE_NOTHING_TO_RETRACT' });
   assert.throws(() => planStoreAction({ ...retract, approval: `WRITE:${digestA}` }), { code: 'STORE_APPROVAL_REQUIRED' });
   assert.throws(() => planStoreAction({ ...retract, backupPath: '' }), { code: 'STORE_BACKUP_REQUIRED' });
 });
 
-function approvedWrite(fake, extra = {}) {
+function memoryReceipt() {
+  const files = new Map();
   return {
-    db: fake.db, auth: fake.auth, backup: memoryBackup(), target: 'emulator', action: 'write', uid: UID,
+    files,
+    create: async (file, body) => { if (files.has(file)) throw new Error('EEXIST'); files.set(file, structuredClone(body)); },
+    update: async (file, body) => { files.set(file, structuredClone(body)); },
+  };
+}
+
+let receiptCount = 0;
+function approvedWrite(fake, extra = {}) {
+  receiptCount += 1;
+  return {
+    db: fake.db, auth: fake.auth, backup: memoryBackup(), receipt: memoryReceipt(), receiptPath: `/private/receipt-${receiptCount}.json`,
+    target: 'emulator', action: 'write', uid: UID,
     confirmUid: UID, approval: `WRITE:${digestA}`, input: envA, expectCurrent: 'none', apply: true, ...extra,
   };
 }
@@ -204,7 +219,8 @@ test('write, replace with backup, retract and restore round-trip through the exa
   assert.deepEqual(fake.paths.at(-1), `blitzOwners/${UID}/campaign/current`);
   assert.deepEqual(fake.writes, ['create']);
   assert.equal(created.liveDigest, digestA);
-  assert.deepEqual(created.rollback, { action: 'retract', expectCurrent: digestA, approval: `RETRACT:${digestA}` });
+  assert.equal(created.outcome, 'committed-verified');
+  assert.deepEqual(created.rollback, { action: 'retract', expectCurrent: digestA, approval: `RETRACT:${digestA}`, backupRequired: true });
   assert.equal(envelopeDigest(fake.current()), digestA);
 
   const backup = memoryBackup();
@@ -212,13 +228,13 @@ test('write, replace with backup, retract and restore round-trip through the exa
   assert.equal(envelopeDigest(backup.files.get('/b1')), digestA);
   assert.equal(replaced.previousDigest, digestA);
   assert.equal(replaced.backupWritten, true);
-  assert.deepEqual(replaced.rollback, { action: 'write', input: 'the backup file', expectCurrent: digestB, approval: `WRITE:${digestA}` });
+  assert.deepEqual(replaced.rollback, { action: 'write', input: '/b1', inputDigest: digestA, expectCurrent: digestB, approval: `WRITE:${digestA}`, backupRequired: true });
 
   const backup2 = memoryBackup();
   const retracted = await runStoreAction(approvedWrite(fake, { backup: backup2, action: 'retract', input: null, approval: `RETRACT:${digestB}`, expectCurrent: digestB, backupPath: '/b2' }));
   assert.equal(fake.current(), null);
   assert.equal(retracted.liveDigest, null);
-  assert.deepEqual(retracted.rollback, { action: 'write', input: 'the backup file', expectCurrent: 'none', approval: `WRITE:${digestB}` });
+  assert.deepEqual(retracted.rollback, { action: 'write', input: '/b2', inputDigest: digestB, expectCurrent: 'none', approval: `WRITE:${digestB}`, backupRequired: false });
 
   // Restore exactly what was retracted, from its backup.
   await runStoreAction(approvedWrite(fake, { input: backup2.files.get('/b2'), approval: `WRITE:${digestB}`, expectCurrent: 'none' }));
@@ -232,8 +248,9 @@ test('a concurrent change, failed readback, bad backup or foreign document stops
   assert.deepEqual(raced.writes, []);
   assert.equal(envelopeDigest(raced.current()), digestB);
 
+  // A commit that reads back as something else is an unknown outcome, never "verified".
   const corrupt = fakeFirebase({ corruptCommit: true });
-  await assert.rejects(runStoreAction(approvedWrite(corrupt)), { code: 'STORE_READBACK_FAILED' });
+  await assert.rejects(runStoreAction(approvedWrite(corrupt)), { code: 'STORE_OUTCOME_UNKNOWN' });
 
   const existing = fakeFirebase({ doc: envA });
   const lying = { write: async () => digestB };
@@ -286,7 +303,7 @@ test('backup files are exclusive, mode 600, and verified by re-reading', async (
 function cli(args, env) {
   const clean = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (/^(BLITZ_|FIRESTORE_EMULATOR_HOST|FIREBASE_AUTH_EMULATOR_HOST|GOOGLE_APPLICATION_CREDENTIALS|FIREBASE_TOKEN|CI$|GITHUB_ACTIONS)|PASSPHRASE/i.test(key)) continue;
+    if (/^(BLITZ_|FIRESTORE_EMULATOR_HOST|FIREBASE_AUTH_EMULATOR_HOST|CI$|GITHUB_ACTIONS)|PASSPHRASE/i.test(key) || isCredentialEnvKey(key)) continue;
     clean[key] = value;
   }
   return spawnSync(process.execPath, ['scripts/blitz-campaign-store.mjs', ...args], {

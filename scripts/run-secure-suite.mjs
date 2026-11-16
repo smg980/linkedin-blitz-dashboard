@@ -11,6 +11,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isCredentialEnvKey } from '../secure/campaign-store.mjs';
 import { findChrome } from './secure-browser-check.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -568,8 +569,10 @@ async function main() {
 
     const env = { ...process.env };
     delete env.DASHBOARD_PASSPHRASE;
-    delete env.GOOGLE_APPLICATION_CREDENTIALS;
-    delete env.FIREBASE_TOKEN;
+    // F4: every spelling of a credential override, including google_application_credentials.
+    for (const key of Object.keys(env)) if (isCredentialEnvKey(key)) delete env[key];
+    // A private, per-run operator lock directory for the D0 rehearsal.
+    env.BLITZ_OPERATOR_LOCK_DIR = path.join(tmp, 'operator-lock');
     const bin = path.join(ROOT, 'node_modules', '.bin', 'firebase');
     const command = `${shellQuote(process.execPath)} ${shellQuote(launcherPath)}`;
     const child = spawn(bin, [

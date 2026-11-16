@@ -11,8 +11,21 @@
 //     (WRITE:<input digest> or RETRACT:<current digest>),
 //   - the digest the operator expects to be live now (--expect-current, or "none"),
 //     re-checked inside a Firestore transaction,
-//   - a backup file of the current ciphertext whenever a document already exists.
+//   - a backup file of the current ciphertext whenever a document already exists,
+//   - a private recovery receipt (F6), persisted before any mutation.
 // Output carries booleans and envelope digests only: never a uid, email or claim.
+//
+// Outcomes (F6). Every apply ends in exactly one of:
+//   refused-before-write           nothing was committed (CAS mismatch, owner
+//                                   changed, backup or receipt failure, read error
+//                                   before the write was staged)
+//   committed-verified             the commit was acknowledged and read back
+//   unknown                        the commit may or may not have applied (lost
+//                                   acknowledgement, failed or mismatched readback)
+//   committed-eligibility-changed  committed and read back, but the owner record
+//                                   changed during the commit (claim race)
+// The transaction runs with maxAttempts 1, so an ambiguous commit is never
+// retried by the SDK or by this tool. The receipt records what to do either way.
 import { createHash } from 'node:crypto';
 import { isEnvelope } from './envelope.mjs';
 
@@ -23,6 +36,18 @@ export const MAX_ENVELOPE_BYTES = 1_000_000;
 const UID = /^[A-Za-z0-9_-]{1,128}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
 const LOOPBACK_HOST = /^(127\.0\.0\.1|localhost):\d{1,5}$/;
+// F4: google-auth-library reads GOOGLE_APPLICATION_CREDENTIALS *and*
+// google_application_credentials; gcloud honours its own overrides. Any
+// spelling, present at all (even empty), is refused.
+const CREDENTIAL_ENV = /^(GOOGLE_APPLICATION_CREDENTIALS|FIREBASE_TOKEN|GOOGLE_OAUTH_ACCESS_TOKEN|CLOUDSDK_AUTH_ACCESS_TOKEN|CLOUDSDK_AUTH_ACCESS_TOKEN_FILE|CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE|GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES)$/i;
+
+export function isCredentialEnvKey(key) {
+  return CREDENTIAL_ENV.test(key);
+}
+
+export function credentialEnvPresent(env = {}) {
+  return Object.keys(env).some(isCredentialEnvKey);
+}
 
 export class StoreRefusal extends Error {
   constructor(code) {
@@ -83,19 +108,76 @@ export function assertTarget({ target, projectId, env = {} }) {
       'STORE_EMULATOR_PROJECT');
     need(LOOPBACK_HOST.test(env.FIRESTORE_EMULATOR_HOST || ''), 'STORE_LOOPBACK_FIRESTORE_REQUIRED');
     need(LOOPBACK_HOST.test(env.FIREBASE_AUTH_EMULATOR_HOST || ''), 'STORE_LOOPBACK_AUTH_REQUIRED');
-    need(!env.GOOGLE_APPLICATION_CREDENTIALS && !env.FIREBASE_TOKEN, 'STORE_CREDENTIAL_ENV_REFUSED');
+    need(!credentialEnvPresent(env), 'STORE_CREDENTIAL_ENV_REFUSED');
     return { target, projectId };
   }
   if (target === 'production') {
     need(projectId === PRODUCTION_PROJECT, 'STORE_PRODUCTION_PROJECT');
     need(!env.CI && !env.GITHUB_ACTIONS, 'STORE_NEVER_FROM_CI');
     need(!env.FIRESTORE_EMULATOR_HOST && !env.FIREBASE_AUTH_EMULATOR_HOST, 'STORE_EMULATOR_ENV_WITH_PRODUCTION');
-    // Use the operator's existing authorized gcloud session (ADC), never a key file or CI token.
-    need(!env.GOOGLE_APPLICATION_CREDENTIALS && !env.FIREBASE_TOKEN, 'STORE_KEY_FILE_REFUSED');
+    // Never a key file, an access-token override or a CI token. The credential is
+    // the operator's own user ADC file, checked by assertOperatorCredential and
+    // bound to the active gcloud account; generic ADC is never consulted.
+    need(!credentialEnvPresent(env), 'STORE_KEY_FILE_REFUSED');
     need(!Object.keys(env).some((key) => /PASSPHRASE/i.test(key) && env[key]), 'STORE_PASSPHRASE_IN_ENV');
     return { target, projectId };
   }
   throw new StoreRefusal('STORE_INVALID_TARGET');
+}
+
+// F4: the one production credential Step D accepts is the gcloud user ADC file
+// written by `gcloud auth application-default login` in the operator's session
+// (type authorized_user). Service-account keys, impersonation, external
+// accounts and the metadata server are all refused. The returned object is
+// handed to the Admin SDK directly, so the SDK never searches for credentials.
+const ADC_FIELDS = new Set(['type', 'client_id', 'client_secret', 'refresh_token', 'quota_project_id', 'universe_domain', 'account']);
+
+export function assertOperatorCredential({ text, info, operatorUid, projectId }) {
+  need(info && info.isFile() && !info.isSymbolicLink(), 'STORE_ADC_NOT_REGULAR_FILE');
+  need(operatorUid == null || info.uid === operatorUid, 'STORE_ADC_NOT_OWNED_BY_OPERATOR');
+  need((info.mode & 0o022) === 0, 'STORE_ADC_WRITABLE_BY_OTHERS');
+  let cred;
+  try {
+    cred = JSON.parse(text);
+  } catch {
+    throw new StoreRefusal('STORE_ADC_UNREADABLE');
+  }
+  need(cred && typeof cred === 'object' && !Array.isArray(cred), 'STORE_ADC_UNREADABLE');
+  need(cred.type === 'authorized_user', 'STORE_ADC_NOT_USER_CREDENTIAL');
+  need(Object.keys(cred).every((key) => ADC_FIELDS.has(key)), 'STORE_ADC_UNEXPECTED_FIELDS');
+  for (const key of ['client_id', 'client_secret', 'refresh_token']) {
+    need(typeof cred[key] === 'string' && cred[key].length > 0, 'STORE_ADC_UNREADABLE');
+  }
+  need(cred.quota_project_id === projectId, 'STORE_ADC_QUOTA_PROJECT');
+  need(cred.universe_domain == null || cred.universe_domain === 'googleapis.com', 'STORE_ADC_UNIVERSE');
+  return cred;
+}
+
+// Binds that credential to the account the gcloud CLI says is active. Neither
+// identity is returned or printed; only whether they are the same account.
+export function assertSameOperator({ adcEmail, adcEmailVerified, gcloudAccount }) {
+  need(typeof adcEmail === 'string' && adcEmail.includes('@') && adcEmailVerified === true, 'STORE_ADC_IDENTITY_UNAVAILABLE');
+  need(typeof gcloudAccount === 'string' && gcloudAccount.includes('@'), 'STORE_GCLOUD_ACCOUNT_UNAVAILABLE');
+  need(adcEmail.trim().toLowerCase() === gcloudAccount.trim().toLowerCase(), 'STORE_ADC_IDENTITY_MISMATCH');
+  return true;
+}
+
+// Everything about the Auth record that decides whether a write is allowed,
+// reduced to one digest. Never printed.
+export function eligibilityFingerprint(user) {
+  const sortDeep = (value) => (Array.isArray(value)
+    ? value.map(sortDeep)
+    : value && typeof value === 'object'
+      ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortDeep(value[key])]))
+      : value);
+  return createHash('sha256').update(JSON.stringify(sortDeep({
+    uid: user?.uid ?? null,
+    disabled: user?.disabled ?? null,
+    emailVerified: user?.emailVerified ?? null,
+    providers: Array.isArray(user?.providerData) ? user.providerData.map((p) => p?.providerId ?? null).sort() : null,
+    customClaims: user?.customClaims ?? null,
+    tokensValidAfterTime: user?.tokensValidAfterTime ?? null,
+  })), 'utf8').digest('hex');
 }
 
 export function ownerEligibility(user, uid) {
@@ -109,7 +191,7 @@ export function ownerEligibility(user, uid) {
   return { ...checks, eligible: Object.values(checks).every(Boolean) };
 }
 
-export function planStoreAction({ target, action, uid, confirmUid, approval, user, current, input, expectCurrent, backupPath, apply = false }) {
+export function planStoreAction({ target, action, uid, confirmUid, approval, user, current, input, expectCurrent, backupPath, receiptPath, apply = false }) {
   need(['inspect', 'write', 'retract'].includes(action), 'STORE_INVALID_ACTION');
   need(typeof apply === 'boolean', 'STORE_INVALID_APPLY');
   campaignPath(uid);
@@ -147,6 +229,7 @@ export function planStoreAction({ target, action, uid, confirmUid, approval, use
   // Retract stays possible for a revoked or disabled owner; writing needs a live owner.
   if (action === 'write') need(eligibility.eligible, 'STORE_OWNER_NOT_ELIGIBLE');
   if (current) need(typeof backupPath === 'string' && backupPath.length > 0, 'STORE_BACKUP_REQUIRED');
+  need(typeof receiptPath === 'string' && receiptPath.length > 0, 'STORE_RECEIPT_REQUIRED');
   return plan;
 }
 
@@ -160,51 +243,191 @@ function currentFrom(snapshot) {
   }
 }
 
-// db: { doc(path) -> ref{ get() }, runTransaction(fn(tx{ get, create, set, delete })) }
+function refusal(code, outcome) {
+  const error = new StoreRefusal(code);
+  error.outcome = outcome;
+  return error;
+}
+
+// What undoes this mutation if it committed. A first write is undone by a
+// retract (which needs its own backup); a replacement or a retract by writing
+// the backup back, with the CAS value the undo will need.
+export function rollbackIfCommitted({ action, plan, backupPath }) {
+  const after = action === 'write' ? plan.inputDigest : 'none';
+  if (!plan.currentDigest) {
+    return { action: 'retract', expectCurrent: after, approval: `RETRACT:${after}`, backupRequired: true };
+  }
+  return {
+    action: 'write',
+    input: backupPath,
+    inputDigest: plan.currentDigest,
+    expectCurrent: after,
+    approval: `WRITE:${plan.currentDigest}`,
+    backupRequired: after !== 'none',
+  };
+}
+
+// db: { doc(path) -> ref{ get() }, runTransaction(fn(tx{ get, create, set, delete }), { maxAttempts }) }
 // auth: { getUser(uid) }
 // backup: { write(path, envelope) -> digest of what was written and re-read }
-export async function runStoreAction({ db, auth, backup, target, action, uid, confirmUid, approval, input, expectCurrent, backupPath, apply = false }) {
+// receipt: { create(path, body) exclusive + durable, update(path, body) atomic + durable }
+export async function runStoreAction({ db, auth, backup, receipt, target, projectId, action, uid, confirmUid, approval, input, expectCurrent, backupPath, receiptPath, apply = false, now = () => new Date().toISOString() }) {
   const path = campaignPath(uid);
-  let user;
-  try {
-    user = await auth.getUser(uid);
-  } catch {
-    throw new StoreRefusal('STORE_UNKNOWN_UID');
-  }
+  const readUser = async () => {
+    try {
+      return await auth.getUser(uid);
+    } catch {
+      throw new StoreRefusal('STORE_UNKNOWN_UID');
+    }
+  };
+  const user = await readUser();
   const ref = db.doc(path);
   const current = currentFrom(await ref.get());
-  const plan = planStoreAction({ target, action, uid, confirmUid, approval, user, current, input, expectCurrent, backupPath, apply });
+  const plan = planStoreAction({ target, action, uid, confirmUid, approval, user, current, input, expectCurrent, backupPath, receiptPath, apply });
   if (!apply) return { dryRun: true, ...plan };
+  need(receipt && typeof receipt.create === 'function' && typeof receipt.update === 'function', 'STORE_RECEIPT_REQUIRED');
 
-  let backupDigest = null;
+  const planned = eligibilityFingerprint(user);
+  const intended = action === 'write' ? plan.inputDigest : 'none';
+  const record = {
+    version: 1,
+    tool: 'blitz-campaign-store',
+    target,
+    projectId: projectId ?? null,
+    action,
+    uidSha256: createHash('sha256').update(uid, 'utf8').digest('hex'),
+    createdAt: now(),
+    updatedAt: null,
+    status: 'PREPARED',
+    refusal: null,
+    expectCurrent,
+    previousDigest: plan.currentDigest,
+    intendedDigest: intended,
+    backup: { required: Boolean(current), path: current ? backupPath : null, digest: null, verified: false },
+    observedDigest: null,
+    rollbackIfCommitted: rollbackIfCommitted({ action, plan, backupPath }),
+    ifNotCommitted: 'Nothing to undo. Run inspect; never repeat an apply without a fresh dry run.',
+  };
+  const save = async (patch, { first = false } = {}) => {
+    Object.assign(record, patch, { updatedAt: now() });
+    if (first) await receipt.create(receiptPath, structuredClone(record));
+    else await receipt.update(receiptPath, structuredClone(record));
+  };
+  // Records a refusal before any write. The receipt update is best effort: the
+  // refusal stands either way and nothing was mutated.
+  const refuseBeforeWrite = async (code) => {
+    try { await save({ status: 'REFUSED_PRE_WRITE', refusal: code }); } catch { /* still refused */ }
+    return refusal(code, 'refused-before-write');
+  };
+  const observe = async () => {
+    try {
+      const seen = currentFrom(await ref.get());
+      return seen ? envelopeDigest(seen) : 'none';
+    } catch {
+      return 'unreadable';
+    }
+  };
+
+  try {
+    await save({}, { first: true });
+  } catch {
+    throw refusal('STORE_RECEIPT_FAILED', 'refused-before-write');
+  }
   if (current) {
-    backupDigest = await backup.write(backupPath, current);
-    need(backupDigest === plan.currentDigest, 'STORE_BACKUP_VERIFICATION_FAILED');
+    let backupDigest;
+    try {
+      backupDigest = await backup.write(backupPath, current);
+    } catch {
+      throw await refuseBeforeWrite('STORE_BACKUP_FAILED');
+    }
+    if (backupDigest !== plan.currentDigest) throw await refuseBeforeWrite('STORE_BACKUP_VERIFICATION_FAILED');
+    record.backup = { ...record.backup, digest: backupDigest, verified: true };
   }
-  await db.runTransaction(async (tx) => {
-    const latest = currentFrom(await tx.get(ref));
-    need((latest ? envelopeDigest(latest) : 'none') === expectCurrent, 'STORE_CONCURRENT_CHANGE');
-    if (action === 'retract') tx.delete(ref);
-    else if (latest) tx.set(ref, input);
-    else tx.create(ref, input);
-  });
-  const after = currentFrom(await ref.get());
-  if (action === 'write') {
-    need(after && envelopeDigest(after) === plan.inputDigest, 'STORE_READBACK_FAILED');
-  } else {
-    need(after === null, 'STORE_READBACK_FAILED');
+  // Claim race: the owner record must be unchanged and eligible right before
+  // the commit. Firestore cannot lock Auth, so this re-check, the one inside
+  // the transaction and the one after it narrow the window; the operator lock
+  // (secure/operator-lock.mjs) keeps claim tools and this tool from overlapping.
+  const unchangedOwner = async () => {
+    const latest = await readUser();
+    return ownerEligibility(latest, uid).eligible && eligibilityFingerprint(latest) === planned;
+  };
+  if (action === 'write' && !(await unchangedOwner().catch(() => false))) {
+    throw await refuseBeforeWrite('STORE_OWNER_CHANGED_BEFORE_COMMIT');
   }
-  const liveDigest = after ? plan.inputDigest : null;
+  try {
+    await save({ status: 'READY_TO_COMMIT' });
+  } catch {
+    throw refusal('STORE_RECEIPT_FAILED', 'refused-before-write');
+  }
+
+  let staged = false;
+  let callbackDone = false;
+  let callbackRefusal = null;
+  try {
+    await db.runTransaction(async (tx) => {
+      let latest;
+      try {
+        latest = currentFrom(await tx.get(ref));
+      } catch (error) {
+        callbackRefusal = error instanceof StoreRefusal ? error.code : 'STORE_PRE_WRITE_READ_FAILED';
+        throw error;
+      }
+      if ((latest ? envelopeDigest(latest) : 'none') !== expectCurrent) {
+        callbackRefusal = 'STORE_CONCURRENT_CHANGE';
+        throw new StoreRefusal(callbackRefusal);
+      }
+      if (action === 'write' && !(await unchangedOwner().catch(() => false))) {
+        callbackRefusal = 'STORE_OWNER_CHANGED_BEFORE_COMMIT';
+        throw new StoreRefusal(callbackRefusal);
+      }
+      staged = true;
+      if (action === 'retract') tx.delete(ref);
+      else if (latest) tx.set(ref, input);
+      else tx.create(ref, input);
+      callbackDone = true;
+    }, { maxAttempts: 1 });
+  } catch {
+    if (!staged || !callbackDone) {
+      // The callback stopped before returning: the SDK never sent a commit.
+      throw await refuseBeforeWrite(callbackRefusal || 'STORE_PRE_WRITE_FAILED');
+    }
+    // The commit was sent and its result is not known. Record, never retry.
+    const observedDigest = await observe();
+    try { await save({ status: 'OUTCOME_UNKNOWN', observedDigest }); } catch { /* reported below */ }
+    throw refusal('STORE_OUTCOME_UNKNOWN', 'unknown');
+  }
+
+  let afterDigest;
+  try {
+    const after = currentFrom(await ref.get());
+    afterDigest = after ? envelopeDigest(after) : 'none';
+  } catch {
+    afterDigest = 'unreadable';
+  }
+  if (afterDigest !== intended) {
+    try { await save({ status: 'OUTCOME_UNKNOWN', observedDigest: afterDigest }); } catch { /* reported below */ }
+    throw refusal('STORE_OUTCOME_UNKNOWN', 'unknown');
+  }
+  if (action === 'write' && !(await unchangedOwner().catch(() => false))) {
+    try { await save({ status: 'COMMITTED_ELIGIBILITY_CHANGED', observedDigest: afterDigest }); } catch { /* reported below */ }
+    throw refusal('STORE_ELIGIBILITY_CHANGED_DURING_COMMIT', 'committed-eligibility-changed');
+  }
+  try {
+    await save({ status: 'COMMITTED_VERIFIED', observedDigest: afterDigest });
+  } catch {
+    // Committed and verified, but the receipt could not record it: say so.
+    throw refusal('STORE_RECEIPT_FAILED_AFTER_COMMIT', 'committed-verified');
+  }
+  const liveDigest = afterDigest === 'none' ? null : afterDigest;
   return {
     dryRun: false,
     verified: true,
+    outcome: 'committed-verified',
     action,
     previousDigest: plan.currentDigest,
     liveDigest,
-    backupWritten: backupDigest !== null,
-    // Exactly how to undo this, with the CAS value it will need.
-    rollback: plan.currentDigest
-      ? { action: 'write', input: 'the backup file', expectCurrent: liveDigest || 'none', approval: `WRITE:${plan.currentDigest}` }
-      : { action: 'retract', expectCurrent: liveDigest, approval: `RETRACT:${liveDigest}` },
+    backupWritten: record.backup.verified,
+    receiptWritten: true,
+    rollback: record.rollbackIfCommitted,
   };
 }

@@ -157,7 +157,11 @@ point is added here.
    explicit exact-UID confirmation immediately before mutation. Confirm project,
    operation, eligibility and preservation of all unrelated claims. Never accept
    an approval inherited from CI or the earlier Step C deployment approval.
-4. With one operator and no concurrent custom-claim writers, re-read that exact
+4. Hold the operator lock for the whole claim change, in a second terminal:
+   `node scripts/blitz-operator-lock.mjs hold --project master-intelligence-5496f`.
+   A Step D store `--apply` refuses (`STORE_OPERATOR_LOCK_HELD`) while it is held,
+   and this step must not start if the lock is already held. Release it with Enter
+   only after step 6. With one operator and no concurrent custom-claim writers, re-read that exact
    account and compare its UID, identity attributes and complete claims against
    the approved snapshot. Abort on drift. The Admin SDK replaces the whole claim
    map and offers no compare-and-swap; the re-read alone cannot prevent races.
