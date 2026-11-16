@@ -115,3 +115,45 @@ test('R3: a non-user credential is refused before any client exists', async () =
       (e) => e instanceof StoreRefusal && e.code === 'STORE_ADC_NOT_USER_CREDENTIAL');
   }
 });
+
+// R5: maxAttempts 1 only stops the transaction runner. The GAPIC config for
+// Commit retries UNAVAILABLE and RESOURCE_EXHAUSTED with backoff, so a commit
+// that applied and lost its acknowledgement was sent again. Count the RPCs.
+for (const [label, status, applies] of [
+  ['UNAVAILABLE after the write applied (lost acknowledgement)', 'UNAVAILABLE', true],
+  ['RESOURCE_EXHAUSTED before the write applied', 'RESOURCE_EXHAUSTED', false],
+]) {
+  test(`R5: a Commit failing with ${label} is sent exactly once and reported unknown`, { skip: !HAVE_OPENSSL && 'openssl unavailable', timeout: 60000 }, async () => {
+    let grpcStatus;
+    const h = await harness({
+      commitFault: (attempt, request, apply) => {
+        if (attempt > 1) { apply(); return null; } // a retry would "succeed"
+        if (applies) apply();
+        return { code: grpcStatus[status], details: `synthetic ${status}` };
+      },
+    });
+    grpcStatus = h.firestore.grpcStatus;
+    try {
+      const receipt = path.join(h.work, 'receipt.json');
+      const error = await main(writeArgs(h, receipt), writeEnv(h), h.deps).catch((e) => e);
+      assert.equal(h.firestore.state.commits.length, 1, 'Commit RPCs sent');
+      assert.ok(error instanceof StoreRefusal, 'the run does not report success');
+      assert.equal(error.code, 'STORE_OUTCOME_UNKNOWN');
+      assert.equal(error.outcome, 'unknown');
+      assert.equal(JSON.parse(await fs.readFile(receipt, 'utf8')).status, 'OUTCOME_UNKNOWN');
+    } finally {
+      await h.close();
+    }
+  });
+}
+
+test('R5: production and emulator Firestore settings disable Commit and channel retries', async () => {
+  const { firestoreSettings, COMMIT_NO_RETRY_CLIENT_CONFIG } = await import('../secure/operator-clients.mjs');
+  const settings = firestoreSettings({ projectId: PRODUCTION_PROJECT });
+  assert.equal(settings.preferRest, false);
+  assert.equal(settings['grpc.enable_retries'], 0);
+  assert.equal(settings['grpc.service_config_disable_resolution'], 1);
+  assert.equal(settings.clientConfig, COMMIT_NO_RETRY_CLIENT_CONFIG);
+  const service = COMMIT_NO_RETRY_CLIENT_CONFIG.interfaces['google.firestore.v1.Firestore'];
+  assert.deepEqual(service.retry_codes[service.methods.Commit.retry_codes_name], []);
+});
