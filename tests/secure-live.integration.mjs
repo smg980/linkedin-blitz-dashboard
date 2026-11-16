@@ -9,6 +9,7 @@ import { decryptEnvelope } from '../secure/envelope.mjs';
 import { assertEmulatorTarget } from '../secure/emulator-guard.mjs';
 import { envelopeFromFirestoreFields } from '../secure/firestore-get.mjs';
 import { runSyntheticOwnerAction } from '../scripts/d0-owner-emulator.mjs';
+import { isCredentialEnvKey } from '../secure/campaign-store.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'demo-blitz-secure';
@@ -33,8 +34,7 @@ const users = {};
 function cleanEnv(extra = {}) {
   const env = { ...process.env, ...extra };
   delete env.DASHBOARD_PASSPHRASE;
-  delete env.GOOGLE_APPLICATION_CREDENTIALS;
-  delete env.FIREBASE_TOKEN;
+  for (const key of Object.keys(env)) if (isCredentialEnvKey(key)) delete env[key];
   return env;
 }
 

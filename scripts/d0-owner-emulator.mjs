@@ -3,7 +3,9 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { credentialEnvPresent } from '../secure/campaign-store.mjs';
 import { assertEmulatorTarget } from '../secure/emulator-guard.mjs';
+import { acquireOperatorLock, lockDirectory } from '../secure/operator-lock.mjs';
 
 function requireValue(condition, code) {
   if (!condition) throw new Error(code);
@@ -37,14 +39,27 @@ export async function runSyntheticOwnerAction(options = {}) {
   const host = process.env.FIREBASE_AUTH_EMULATOR_HOST;
   requireValue(/^(127\.0\.0\.1|localhost):[0-9]+$/.test(host || ''), 'D0_LOOPBACK_AUTH_REQUIRED');
   assertEmulatorTarget({ host, projectId });
-  requireValue(!process.env.GOOGLE_APPLICATION_CREDENTIALS && !process.env.FIREBASE_TOKEN
-    && !process.env.DASHBOARD_PASSPHRASE, 'D0_CREDENTIAL_ENV_REFUSED');
+  // F4: every spelling of a credential override, not only the upper-case one.
+  requireValue(!credentialEnvPresent(process.env) && !process.env.DASHBOARD_PASSPHRASE, 'D0_CREDENTIAL_ENV_REFUSED');
   requireValue(/^[A-Za-z0-9_-]{1,128}$/.test(uid || ''), 'D0_INVALID_UID');
   requireValue(['inspect', 'grant', 'revoke'].includes(action), 'D0_INVALID_ACTION');
-  const { initializeApp, deleteApp } = await import('firebase-admin/app');
-  const { getAuth } = await import('firebase-admin/auth');
-  const app = initializeApp({ projectId }, `d0-${process.pid}-${Date.now()}`);
+  // Claim race: a claim change holds the same per-project operator lock as a
+  // Step D store run, so the two never overlap.
+  let lock = null;
+  if (apply) {
+    try {
+      lock = await acquireOperatorLock({ project: projectId, purpose: `d0-${action}`, dir: lockDirectory() });
+    } catch {
+      throw new Error('D0_OPERATOR_LOCK_HELD');
+    }
+  }
+  let app;
+  let deleteApp;
   try {
+    const admin = await import('firebase-admin/app');
+    deleteApp = admin.deleteApp;
+    const { getAuth } = await import('firebase-admin/auth');
+    app = admin.initializeApp({ projectId }, `d0-${process.pid}-${Date.now()}`);
     const auth = getAuth(app);
     const user = await auth.getUser(uid); // Exact lookup only; never exports/listUsers.
     const plan = planOwnerAction(user, options);
@@ -66,7 +81,8 @@ export async function runSyntheticOwnerAction(options = {}) {
     // SDK errors can contain emails, UIDs or remote response bodies. Never print them.
     throw new Error('D0_EMULATOR_OPERATION_FAILED');
   } finally {
-    await deleteApp(app);
+    if (app) await deleteApp(app);
+    if (lock) await lock.release();
   }
 }
 

@@ -15,6 +15,7 @@
     "build:secure-shell": "node scripts/build-secure-shell.mjs",
     "verify:secure-shell": "node scripts/verify-secure-shell.mjs",
     "test:secure": "node scripts/run-secure-suite.mjs",
+    "test:store": "node scripts/run-campaign-store-suite.mjs",
     "ingest:synthetic-emulator": "node scripts/ingest-synthetic-emulator.mjs"
   },
   "engines": {

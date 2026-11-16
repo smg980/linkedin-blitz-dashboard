@@ -27,7 +27,7 @@ npm run test:secure
 
 ## Real campaign data
 
-Loading the live campaign, or any real contacts, is not part of this tool. That remains a separate approved step and must use an approved source. Do not point this ingestion tool at production.
+The synthetic ingestion tool above never loads real contacts. Do not point it at production. The governed Step D tool for the real, already-encrypted campaign is `scripts/blitz-campaign-store.mjs`; see [STEP_D_CAMPAIGN_STORE.md](STEP_D_CAMPAIGN_STORE.md). Every production write or retract needs a separate owner approval.
 
 ## Hosting config
 

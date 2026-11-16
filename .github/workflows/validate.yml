@@ -64,6 +64,16 @@ jobs:
           node --check scripts/run-secure-suite.mjs
           node --check scripts/secure-browser-check.mjs
           node --check tests/secure-live.integration.mjs
+          node --check secure/campaign-store.mjs
+          node --check secure/operator-lock.mjs
+          node --check scripts/blitz-operator-lock.mjs
+          node --check scripts/export-private-envelope.mjs
+          node --check tests/campaign-store-recovery.test.mjs
+          node --check tests/operator-controls.test.mjs
+          node --check tests/export-private-envelope.test.mjs
+          node --check scripts/blitz-campaign-store.mjs
+          node --check scripts/run-campaign-store-suite.mjs
+          node --check tests/campaign-store.integration.mjs
       - name: Run synthetic-only tests
         run: npm test
       - name: Verify committed encrypted GitHub Pages bundle
@@ -82,3 +92,5 @@ jobs:
         env:
           BLITZ_SECURE_ARTIFACTS: ${{ runner.temp }}/blitz-secure-artifacts
         run: npm run test:secure
+      - name: Run Step D campaign store emulator checks (synthetic only)
+        run: npm run test:store
