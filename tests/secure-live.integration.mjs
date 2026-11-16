@@ -8,6 +8,7 @@ import { checkSecureShell } from '../scripts/secure-browser-check.mjs';
 import { decryptEnvelope } from '../secure/envelope.mjs';
 import { assertEmulatorTarget } from '../secure/emulator-guard.mjs';
 import { envelopeFromFirestoreFields } from '../secure/firestore-get.mjs';
+import { runSyntheticOwnerAction } from '../scripts/d0-owner-emulator.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'demo-blitz-secure';
@@ -56,12 +57,10 @@ async function createGoogleUser(email, sub, name) {
 }
 
 async function grantOwnerClaim(uid) {
-  const response = await fetch(`http://${authHost}/identitytoolkit.googleapis.com/v1/accounts:update`, {
-    method: 'POST',
-    headers: { Authorization: 'Bearer owner', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ localId: uid, customAttributes: JSON.stringify({ blitzOwner: true }) }),
+  return runSyntheticOwnerAction({
+    projectId: PROJECT, uid, action: 'grant', apply: true,
+    confirmUid: uid, approval: 'APPLY_SYNTHETIC_ONLY',
   });
-  assert.equal(response.status, 200, 'Auth emulator did not set the synthetic owner claim');
 }
 
 function tokenPayload(idToken) {
@@ -76,6 +75,12 @@ describe('private shell emulators', { concurrency: false }, () => {
   before(async () => {
     users.owner = await createGoogleUser(SYNTHETIC_OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner');
     users.intruder = await createGoogleUser(INTRUDER_EMAIL, 'synthetic-intruder-sub-001', 'Synthetic Intruder');
+    // Both default inspection and a grant dry-run must leave the account unchanged.
+    assert.deepEqual(await runSyntheticOwnerAction({ uid: users.owner.uid }), { dryRun: true, eligible: true, owner: false });
+    assert.equal((await runSyntheticOwnerAction({ uid: users.owner.uid, action: 'grant' })).owner, false);
+    await assert.rejects(runSyntheticOwnerAction({ uid: users.owner.uid, action: 'grant', apply: true,
+      confirmUid: users.intruder.uid, approval: 'APPLY_SYNTHETIC_ONLY' }));
+    assert.equal((await runSyntheticOwnerAction({ uid: users.owner.uid })).owner, false);
     await grantOwnerClaim(users.owner.uid);
     const claimed = await createGoogleUser(SYNTHETIC_OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner');
     assert.equal(claimed.uid, users.owner.uid);
@@ -114,11 +119,39 @@ describe('private shell emulators', { concurrency: false }, () => {
     const data = await decryptEnvelope(envelope, DEMO_PASSPHRASE);
     assert.deepEqual(data.contacts.map((item) => item.contact), ['Example Ada', 'Example Ben', 'Example Cy', 'Example Di']);
     assert.equal(data.example, true);
+
+    // D0 lifecycle regression using the actual Auth SDK, refreshed tokens and rules.
+    const revoke = { uid: users.owner.uid, action: 'revoke', apply: true,
+      confirmUid: users.owner.uid, approval: 'APPLY_SYNTHETIC_ONLY' };
+    assert.deepEqual(await runSyntheticOwnerAction(revoke), { dryRun: false, verified: true, owner: false });
+    assert.equal((await runSyntheticOwnerAction({ uid: users.intruder.uid })).owner, false);
+    const revoked = await createGoogleUser(SYNTHETIC_OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner');
+    assert.equal(revoked.uid, users.owner.uid);
+    assert.notEqual(tokenPayload(revoked.idToken).blitzOwner, true);
+    assert.equal((await fetch(docUrl(users.owner.uid), { headers: { Authorization: `Bearer ${revoked.idToken}` } })).status, 403);
+    // The unchanged rules inspect token claims, not refresh-token revocation state.
+    // An already minted owner token remains valid until expiry. Do not imply instant revocation.
+    assert.equal((await fetch(docUrl(users.owner.uid), { headers: { Authorization: `Bearer ${users.owner.idToken}` } })).status, 200);
+    await runSyntheticOwnerAction(revoke); // Repeated revoke remains safe.
+    await grantOwnerClaim(users.owner.uid); // Restore only the fictional fixture for the browser test.
+    users.owner.idToken = (await createGoogleUser(SYNTHETIC_OWNER_EMAIL, 'synthetic-owner-sub-001', 'Synthetic Owner')).idToken;
+    assert.equal((await fetch(docUrl(users.owner.uid), { headers: { Authorization: `Bearer ${users.owner.idToken}` } })).status, 200);
   });
 
   test('a verified Google user without the claim is denied on their own path', async () => {
     const response = await fetch(docUrl(users.intruder.uid), { headers: { Authorization: `Bearer ${users.intruder.idToken}` } });
     assert.equal(response.status, 403);
+    for (const value of ['true', 1, false]) {
+      const update = await fetch(`http://${authHost}/identitytoolkit.googleapis.com/v1/accounts:update`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer owner', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ localId: users.intruder.uid, customAttributes: JSON.stringify({ blitzOwner: value }) }),
+      });
+      assert.equal(update.status, 200);
+      const fresh = await createGoogleUser(INTRUDER_EMAIL, 'synthetic-intruder-sub-001', 'Synthetic Intruder');
+      assert.equal(tokenPayload(fresh.idToken).blitzOwner, value);
+      assert.equal((await fetch(docUrl(users.intruder.uid), { headers: { Authorization: `Bearer ${fresh.idToken}` } })).status, 403);
+    }
   });
 
   test('a claim holder cannot read another uid path', async () => {
