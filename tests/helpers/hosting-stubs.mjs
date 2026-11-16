@@ -29,10 +29,18 @@
 //   version-hash-stale    R1: the new version lists the right paths but one file's
 //                         content hash is not the frozen file's
 //   drift-after-verify    R1: the channel changes once the release has been checked
+//   baseline-arbitrary-js R2: the live shell (and its version) serve a shell.js that
+//                         passes every structural check but is not the approved one
+//   baseline-version-hash R2: the rollback version's Hosting hash for shell.js is not
+//                         the approved record's, although the served bytes are
+//   baseline-record-other-version  R2: the approved record names another version
+// Shell-baseline runs get an approved release record of the pre-deploy shell
+// (BLITZ_APPROVED_BASELINE_RECORD[_SHA256]) unless record: false.
 // Version file hashes are the CLI's representation: SHA-256 of gzip level 9.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { gzipSync } from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -157,7 +165,7 @@ process.stdout.write('False\\n');
 
 const NPM_STUB = `#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_NPM_LOG"
-for name in BLITZ_APPROVE_SECURE_SHELL_DEPLOY BLITZ_APPROVED_COMMIT BLITZ_EXPECTED_DEMO_RELEASE BLITZ_EXPECTED_LIVE_RELEASE BLITZ_RELEASE_BASELINE; do
+for name in BLITZ_APPROVE_SECURE_SHELL_DEPLOY BLITZ_APPROVED_COMMIT BLITZ_EXPECTED_DEMO_RELEASE BLITZ_EXPECTED_LIVE_RELEASE BLITZ_RELEASE_BASELINE BLITZ_APPROVED_BASELINE_RECORD BLITZ_APPROVED_BASELINE_RECORD_SHA256; do
   if env | grep -q "^$name="; then printf '%s\\n' "APPROVAL_VAR_PRESENT $name" >> "$STUB_NPM_LOG"; fi
 done
 if [ "$1" = run ] && [ "$2" = test:secure ]; then
@@ -252,7 +260,8 @@ if (url === api + '/channels/live') {
     const names = [...(baseline === 'shell' ? SHELL : DEMO)];
     if (mode === 'rollback-extra') names.push('campaign-export.json');
     const dir = baseline === 'shell' ? env.STUB_PRE_DIR : env.STUB_DEMO_DIR;
-    body = Buffer.from(JSON.stringify({ files: names.map((n) => versionEntry(n, dir)) }));
+    const stale = mode === 'baseline-version-hash' ? (n) => n === 'shell.js' : null;
+    body = Buffer.from(JSON.stringify({ files: names.map((n) => versionEntry(n, dir, stale)) }));
   }
 } else if (url === api + '/versions/${versionAfter}/files' || url === api + '/versions/${versionOther}/files') {
   if (!authed() || !deployed) status = 401;
@@ -301,7 +310,20 @@ if (writeOut === '%{http_code}') process.stdout.write(String(status));
 // Copies the repository pieces the script needs. For the demo baseline the copy's
 // DEMO_SHA is pointed at a synthetic demo ciphertext; the real value pins a
 // historical build whose bytes are not reproducible.
-export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell } = {}) {
+// R2: the approved record of a shell directory served as `versionName`, built
+// independently of scripts/secure-release.mjs (same canonical form).
+export async function shellRecord(dir, versionName, files) {
+  const sha = (b) => createHash('sha256').update(b).digest('hex');
+  const entries = [];
+  for (const rel of files) {
+    const bytes = await readFile(path.join(dir, rel));
+    entries.push({ path: rel, size: bytes.length, sha256: sha(bytes), hostingHash: sha(gzipSync(bytes, { level: 9 })) });
+  }
+  const text = `${JSON.stringify({ version: 1, site, versionName, files: entries })}\n`;
+  return { text, sha256: sha(Buffer.from(text, 'utf8')) };
+}
+
+export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell, record = true } = {}) {
   const work = await mkdtemp(path.join(os.tmpdir(), 'blitz-release-harness-'));
   const repo = path.join(work, 'repo');
   const bin = path.join(work, 'bin');
@@ -328,6 +350,17 @@ export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell } =
     // What is live before the deploy, independent of what the operator asked for.
     const preIsShell = baseline === 'shell' || mode === 'demo-baseline-shell-live';
     const preDir = preIsShell ? await buildShell(work, 'AIzaSyPREVIOUSLIVESHELLKEY0000000000000') : demoDir;
+    let approvedRecord = null;
+    if (preIsShell && baseline === 'shell' && record) {
+      const { SECURE_SHELL_FILES: files } = await import('../../scripts/verify-secure-shell.mjs');
+      const named = mode === 'baseline-record-other-version' ? 'approvedother01' : versionBefore;
+      approvedRecord = await shellRecord(preDir, `sites/${site}/versions/${named}`, files);
+      approvedRecord.file = path.join(work, 'approved-baseline-record.json');
+      await writeFile(approvedRecord.file, approvedRecord.text);
+      // After approval, the live shell.js is replaced by one that passes every
+      // structural check (no ciphertext reference, same page and config).
+      if (mode === 'baseline-arbitrary-js') await appendFile(path.join(preDir, 'shell.js'), '\n;globalThis.__unapproved = 1;\n');
+    }
     const sites = path.join(work, 'sites.json');
     await writeFile(sites, JSON.stringify({
       status: 'success',
@@ -369,6 +402,10 @@ export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell } =
     } else {
       env.BLITZ_RELEASE_BASELINE = 'shell';
       env.BLITZ_EXPECTED_LIVE_RELEASE = mode === 'wrong-release' ? `sites/${site}/channels/live/releases/1` : releaseBefore;
+      if (approvedRecord) {
+        env.BLITZ_APPROVED_BASELINE_RECORD = approvedRecord.file;
+        env.BLITZ_APPROVED_BASELINE_RECORD_SHA256 = approvedRecord.sha256;
+      }
     }
     const result = spawnSync('bash', [path.join(repo, 'scripts', 'deploy-secure-blitz.sh')], {
       cwd: repo, encoding: 'utf8', timeout: 240000, env,

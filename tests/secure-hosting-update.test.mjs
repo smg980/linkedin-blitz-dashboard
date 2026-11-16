@@ -128,6 +128,10 @@ test('release baseline must be demo or shell and pairs with exactly one expected
     [{ BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, /demo baseline uses BLITZ_EXPECTED_DEMO_RELEASE/],
     [{ BLITZ_RELEASE_BASELINE: 'demo', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, /demo baseline uses BLITZ_EXPECTED_DEMO_RELEASE/],
     [{}, /exact expected live release name is required/],
+    // R2
+    [{ BLITZ_RELEASE_BASELINE: 'shell', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, /needs BLITZ_APPROVED_BASELINE_RECORD/],
+    [{ BLITZ_RELEASE_BASELINE: 'shell', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore, BLITZ_APPROVED_BASELINE_RECORD: '/x', BLITZ_APPROVED_BASELINE_RECORD_SHA256: 'abc' }, /needs BLITZ_APPROVED_BASELINE_RECORD/],
+    [{ BLITZ_EXPECTED_DEMO_RELEASE: releaseBefore, BLITZ_APPROVED_BASELINE_RECORD: '/x' }, /demo baseline takes no baseline record/],
   ];
   try {
     for (const [env, pattern] of cases) {
@@ -145,8 +149,8 @@ test('release baseline must be demo or shell and pairs with exactly one expected
 // stub harness (tests/helpers/hosting-stubs.mjs); see that file for each mode.
 const ROLLBACK = new RegExp(`STEP_C_ROLLBACK_COMMAND=firebase hosting:clone --project ${project} --non-interactive ${site}@${versionBefore} ${site}:live`);
 
-function runUpdate(mode, baseline = 'shell') {
-  return runDeploy({ mode, baseline, buildShell: builtShell });
+function runUpdate(mode, baseline = 'shell', options = {}) {
+  return runDeploy({ mode, baseline, buildShell: builtShell, ...options });
 }
 
 function assertClean(run) {
@@ -186,7 +190,7 @@ test('shell baseline refuses a live fictional demo before deploy', { timeout: 30
   const run = await runUpdate('live-is-demo');
   assertClean(run);
   assert.notEqual(run.result.status, 0);
-  assert.match(run.result.stderr, /not a production secure shell/);
+  assert.match(run.result.stderr, /production secure shell with no public ciphertext/);
   assert.equal(deployCount(run.firebase), 0);
   assert.doesNotMatch(run.result.stderr, /STEP_C_ROLLBACK_COMMAND/);
 });
@@ -195,7 +199,7 @@ test('shell baseline refuses a live shell that still serves public ciphertext', 
   const run = await runUpdate('cipher-live');
   assertClean(run);
   assert.notEqual(run.result.status, 0);
-  assert.match(run.result.stderr, /not a production secure shell with no public ciphertext/);
+  assert.match(run.result.stderr, /production secure shell with no public ciphertext/);
   assert.equal(deployCount(run.firebase), 0);
 });
 
@@ -241,7 +245,7 @@ for (const [mode, label] of [
     const run = await runUpdate(mode);
     assertClean(run);
     assert.notEqual(run.result.status, 0, `${run.result.stdout}\n${run.result.stderr}`);
-    assert.match(run.result.stderr, /not a production secure shell with no public ciphertext/);
+    assert.match(run.result.stderr, /production secure shell with no public ciphertext/);
     assert.equal(deployCount(run.firebase), 0);
     assert.doesNotMatch(run.result.stderr, /STEP_C_ROLLBACK_COMMAND/);
   });
@@ -251,7 +255,7 @@ test('F3: a shell rollback version that lists any extra file is refused before d
   const run = await runUpdate('rollback-extra');
   assertClean(run);
   assert.notEqual(run.result.status, 0);
-  assert.match(run.result.stderr, /not exactly a secure shell; it is not a trustworthy baseline/);
+  assert.match(run.result.stderr, /not exactly the approved secure shell baseline; it is not a trustworthy baseline/);
   assert.equal(deployCount(run.firebase), 0);
 });
 
@@ -278,3 +282,41 @@ for (const [mode, pattern] of [
     assert.doesNotMatch(run.result.stdout, /STEP_C_DEPLOY_VERIFIED/);
   });
 }
+
+// R2: the shell rollback baseline must be an independently approved release
+// record: the live version, its Hosting content hashes and every served byte.
+for (const [mode, label, pattern] of [
+  ['baseline-arbitrary-js', 'a live shell.js that passes every structural check but is not the approved one', /not the approved production secure shell/],
+  ['baseline-version-hash', 'a rollback version whose content hash is not the approved record', /not exactly the approved secure shell baseline/],
+  ['baseline-record-other-version', 'an approved record for a different version', /not the approved baseline version/],
+]) {
+  test(`R2: refuses before deploy when the baseline has ${label}`, { timeout: 300000 }, async () => {
+    const run = await runUpdate(mode);
+    assertClean(run);
+    assert.notEqual(run.result.status, 0, `${run.result.stdout}\n${run.result.stderr}`);
+    assert.match(run.result.stderr, pattern);
+    assert.equal(deployCount(run.firebase), 0);
+    assert.doesNotMatch(run.result.stderr, /STEP_C_ROLLBACK_COMMAND/);
+  });
+}
+
+test('R2: a shell baseline without an approved record is refused before any test or cloud call', { timeout: 300000 }, async () => {
+  const run = await runUpdate('ok', 'shell', { record: false });
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /needs BLITZ_APPROVED_BASELINE_RECORD/);
+  assert.equal(run.npm, '');
+  assert.equal(run.curl, '');
+  assert.equal(deployCount(run.firebase), 0);
+});
+
+test('R2: a verified deploy prints a release record that is itself a valid approved baseline', { timeout: 300000 }, async () => {
+  const { parseReleaseRecord } = await import('../scripts/secure-release.mjs');
+  const run = await runUpdate('ok');
+  assert.equal(run.result.status, 0, `${run.result.stdout}\n${run.result.stderr}`);
+  const text = `${run.result.stdout.match(/^STEP_C_RELEASE_RECORD=(.*)$/m)[1]}\n`;
+  const digest = run.result.stdout.match(/^STEP_C_RELEASE_RECORD_SHA256=([0-9a-f]{64})$/m)[1];
+  const record = parseReleaseRecord(text, digest, site);
+  assert.equal(record.versionName, `sites/${site}/versions/${versionAfter}`);
+  assert.deepEqual(record.files.map((f) => f.path), SECURE_SHELL_FILES);
+  assert.throws(() => parseReleaseRecord(text.replace('"size":', '"size": '), digest, site), /approved digest/);
+});
