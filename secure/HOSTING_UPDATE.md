@@ -2,6 +2,8 @@
 
 Use this when a production secure shell is already live on `master-intelligence-5496f-lb` and a newer, reviewed shell commit has to replace it. The original Step C run used the `demo` baseline, which can no longer pass: the fictional demo is gone and `/data.enc.json` now returns 404.
 
+R2: the `demo` baseline has been **removed** from `deploy-secure-blitz.sh`. It authenticated only the demo's `data.enc.json` digest, so unapproved demo `index.html`/`app.js`/CSS beside the pinned ciphertext passed as a rollback target. `BLITZ_RELEASE_BASELINE` has no default: unset, `demo`, or any value other than `shell` stops the run before any test or cloud call, and so does `BLITZ_EXPECTED_DEMO_RELEASE`. `secure-release.mjs --version-files-demo` now always fails.
+
 **Separate owner approval is required for every run.** It must name the exact commit and the exact live release. Nothing in this document is an approval.
 
 ## What the script enforces in shell mode
@@ -9,7 +11,7 @@ Use this when a production secure shell is already live on `master-intelligence-
 Before anything is deployed:
 
 - One-shot opt-in, approved commit equals `HEAD`, clean tree, not CI, and no passphrase in the environment.
-- `BLITZ_RELEASE_BASELINE=shell` together with `BLITZ_EXPECTED_LIVE_RELEASE`. Setting `BLITZ_EXPECTED_DEMO_RELEASE` as well is refused.
+- `BLITZ_RELEASE_BASELINE=shell` (required, no default) together with `BLITZ_EXPECTED_LIVE_RELEASE`. Setting `BLITZ_EXPECTED_DEMO_RELEASE` is refused.
 - `hosting:blitz` mapping, hosting-only config, billing `False`, and the exact site listed.
 - `npm test`, `verify:bundle`, and `test:secure` with a fresh 7/7 iPhone attestation. Approval variables are kept out of the test processes.
 - A production build from the untracked web config, verified as 15 files with no ciphertext, then **frozen once** into a private release root under `TMPDIR` (outside the repository): read-only copies of the 15 files plus a SHA-256 manifest. Its digest is printed as `STEP_C_RELEASE_MANIFEST_SHA256`. Nothing after this reads `.firebase-blitz-private-shell`.

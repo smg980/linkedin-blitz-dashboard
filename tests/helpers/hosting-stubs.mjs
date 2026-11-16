@@ -23,7 +23,8 @@
 //   live-is-demo          shell baseline requested, but the fictional demo is live
 //   cipher-live           shell baseline, but /data.enc.json is still served
 //   wrong-release         the operator-supplied release is not the live one
-//   demo-baseline-shell-live  demo baseline requested while a shell is live
+//   demo-baseline-shell-live  R2: the removed demo baseline requested while a shell
+//                         is live (must be refused before any cloud call)
 //   live-not-deployed     R1: after the deploy the channel serves another version
 //                         with the same files (a concurrent deploy), not ours
 //   version-hash-stale    R1: the new version lists the right paths but one file's
@@ -36,6 +37,9 @@
 //   baseline-record-other-version  R2: the approved record names another version
 // Shell-baseline runs get an approved release record of the pre-deploy shell
 // (BLITZ_APPROVED_BASELINE_RECORD[_SHA256]) unless record: false.
+// R2: `shell` is the default baseline. baseline: 'demo' reproduces the old
+// operator invocation (BLITZ_EXPECTED_DEMO_RELEASE, no BLITZ_RELEASE_BASELINE)
+// only to prove the script now refuses it.
 // Version file hashes are the CLI's representation: SHA-256 of gzip level 9.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -43,7 +47,7 @@ import { appendFile, chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, 
 import { gzipSync } from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const site = 'master-intelligence-5496f-lb';
@@ -307,9 +311,21 @@ else if (!out) process.stdout.write(body);
 if (writeOut === '%{http_code}') process.stdout.write(String(status));
 `;
 
-// Copies the repository pieces the script needs. For the demo baseline the copy's
-// DEMO_SHA is pointed at a synthetic demo ciphertext; the real value pins a
-// historical build whose bytes are not reproducible.
+// Builds a production-mode secure shell (fictional web config) to serve as the
+// live baseline before the deploy.
+// Resolved through `root` so a relocated copy of this helper still finds it.
+export async function defaultBuildShell(dir, apiKey) {
+  const { buildSecureShell } = await import(pathToFileURL(path.join(root, 'scripts', 'build-secure-shell.mjs')).href);
+  const configPath = path.join(dir, `config-${apiKey.slice(-6)}.json`);
+  await writeFile(configPath, JSON.stringify(webConfig(apiKey)));
+  const out = path.join(dir, `shell-${apiKey.slice(-6)}`);
+  await buildSecureShell({ emulator: false, configPath, out });
+  return out;
+}
+
+// Copies the repository pieces the script needs. For a demo run the copy's
+// DEMO_SHA (if an older reviewed head still has one) is pointed at a synthetic
+// demo ciphertext; the real value pins a historical build.
 // R2: the approved record of a shell directory served as `versionName`, built
 // independently of scripts/secure-release.mjs (same canonical form).
 export async function shellRecord(dir, versionName, files) {
@@ -323,7 +339,22 @@ export async function shellRecord(dir, versionName, files) {
   return { text, sha256: sha(Buffer.from(text, 'utf8')) };
 }
 
-export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell, record = true } = {}) {
+// R2: an approved-record file for gate tests that stop before any live read.
+// The entries describe fictional bytes; only the record's form is checked there.
+export async function writeSyntheticBaselineRecord(dir, versionName = `sites/${site}/versions/${versionBefore}`) {
+  const { SECURE_SHELL_FILES: files } = await import('../../scripts/verify-secure-shell.mjs');
+  const sha = (b) => createHash('sha256').update(b).digest('hex');
+  const entries = files.map((rel) => {
+    const bytes = Buffer.from(`fictional baseline bytes for ${rel}\n`);
+    return { path: rel, size: bytes.length, sha256: sha(bytes), hostingHash: sha(gzipSync(bytes, { level: 9 })) };
+  });
+  const text = `${JSON.stringify({ version: 1, site, versionName, files: entries })}\n`;
+  const file = path.join(dir, 'approved-baseline-record.json');
+  await writeFile(file, text);
+  return { file, sha256: sha(Buffer.from(text, 'utf8')) };
+}
+
+export async function runDeploy({ mode = 'ok', baseline = 'shell', buildShell = defaultBuildShell, record = true } = {}) {
   const work = await mkdtemp(path.join(os.tmpdir(), 'blitz-release-harness-'));
   const repo = path.join(work, 'repo');
   const bin = path.join(work, 'bin');

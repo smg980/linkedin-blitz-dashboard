@@ -118,20 +118,25 @@ function refuse(bin, overrides) {
   });
 }
 
-test('release baseline must be demo or shell and pairs with exactly one expected-release variable', async () => {
+test('release baseline must be exactly shell; the removed demo baseline and its variable are refused', async () => {
   const bin = await refusalBin();
+  const disabled = /demo rollback baseline is disabled/;
   const cases = [
-    [{ BLITZ_RELEASE_BASELINE: 'live' }, /must be demo or shell/],
-    [{ BLITZ_RELEASE_BASELINE: 'SHELL', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, /must be demo or shell/],
+    [{ BLITZ_RELEASE_BASELINE: 'live' }, /must be shell/],
+    [{ BLITZ_RELEASE_BASELINE: 'SHELL', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, /must be shell/],
     [{ BLITZ_RELEASE_BASELINE: 'shell' }, /exact expected live release name is required/],
-    [{ BLITZ_RELEASE_BASELINE: 'shell', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore, BLITZ_EXPECTED_DEMO_RELEASE: releaseBefore }, /shell baseline uses BLITZ_EXPECTED_LIVE_RELEASE/],
-    [{ BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, /demo baseline uses BLITZ_EXPECTED_DEMO_RELEASE/],
-    [{ BLITZ_RELEASE_BASELINE: 'demo', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, /demo baseline uses BLITZ_EXPECTED_DEMO_RELEASE/],
-    [{}, /exact expected live release name is required/],
-    // R2
+    [{ BLITZ_RELEASE_BASELINE: 'shell', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore, BLITZ_EXPECTED_DEMO_RELEASE: releaseBefore }, /BLITZ_EXPECTED_DEMO_RELEASE is no longer accepted/],
+    // R2: no default baseline; `demo` in any spelling the old docs used is refused.
+    [{}, disabled],
+    [{ BLITZ_EXPECTED_DEMO_RELEASE: releaseBefore }, disabled],
+    [{ BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, disabled],
+    [{ BLITZ_RELEASE_BASELINE: 'demo', BLITZ_EXPECTED_DEMO_RELEASE: releaseBefore }, disabled],
+    [{ BLITZ_RELEASE_BASELINE: 'demo', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, disabled],
+    [{ BLITZ_RELEASE_BASELINE: '', BLITZ_EXPECTED_DEMO_RELEASE: releaseBefore }, disabled],
+    [{ BLITZ_RELEASE_BASELINE: 'demo', BLITZ_EXPECTED_DEMO_RELEASE: releaseBefore, BLITZ_APPROVED_BASELINE_RECORD: '/x', BLITZ_APPROVED_BASELINE_RECORD_SHA256: 'a'.repeat(64) }, disabled],
+    // R2 shell record gate (unchanged)
     [{ BLITZ_RELEASE_BASELINE: 'shell', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore }, /needs BLITZ_APPROVED_BASELINE_RECORD/],
     [{ BLITZ_RELEASE_BASELINE: 'shell', BLITZ_EXPECTED_LIVE_RELEASE: releaseBefore, BLITZ_APPROVED_BASELINE_RECORD: '/x', BLITZ_APPROVED_BASELINE_RECORD_SHA256: 'abc' }, /needs BLITZ_APPROVED_BASELINE_RECORD/],
-    [{ BLITZ_EXPECTED_DEMO_RELEASE: releaseBefore, BLITZ_APPROVED_BASELINE_RECORD: '/x' }, /demo baseline takes no baseline record/],
   ];
   try {
     for (const [env, pattern] of cases) {
@@ -222,12 +227,39 @@ test('a live shell that differs from the frozen release after deploy fails and p
   assert.doesNotMatch(run.firebase, /hosting:clone/);
 });
 
-test('the default demo baseline cannot overwrite an already-live shell', { timeout: 300000 }, async () => {
+test('R2: the removed demo baseline cannot overwrite an already-live shell and makes no cloud call', { timeout: 300000 }, async () => {
   const run = await runUpdate('demo-baseline-shell-live', 'demo');
   assertClean(run);
   assert.notEqual(run.result.status, 0);
-  assert.match(run.result.stderr, /Cannot verify existing fictional demo/);
+  assert.match(run.result.stderr, /demo rollback baseline is disabled/);
+  assert.equal(run.npm, '');
+  assert.equal(run.curl, '');
   assert.equal(deployCount(run.firebase), 0);
+});
+
+// R2 (Codex reproduction): a live "demo" whose data.enc.json is the pinned
+// fictional ciphertext but whose index.html, app.js, CSS and every other asset
+// are unapproved bytes (with matching Hosting hashes) reached
+// STEP_C_DEPLOY_VERIFIED at f82bb16. It must now be refused before any test,
+// cloud read or deploy, whatever the surrounding demo assets are.
+test('R2: a demo baseline with unapproved assets beside the pinned ciphertext is refused before deploy', { timeout: 300000 }, async () => {
+  const run = await runDeploy({ baseline: 'demo' });
+  assertClean(run);
+  assert.notEqual(run.result.status, 0, `${run.result.stdout}\n${run.result.stderr}`);
+  assert.match(run.result.stderr, /demo rollback baseline is disabled/);
+  assert.equal(run.npm, '');
+  assert.equal(run.curl, '');
+  assert.equal(deployCount(run.firebase), 0);
+  assert.doesNotMatch(`${run.result.stdout}\n${run.result.stderr}`, /STEP_C_DEPLOY_VERIFIED|STEP_C_ROLLBACK_COMMAND/);
+});
+
+test('R2: the release tool has no demo rollback check any more', () => {
+  const result = spawnSync(process.execPath, [path.join(root, 'scripts', 'secure-release.mjs'), '--version-files-demo'], {
+    cwd: root, encoding: 'utf8', input: JSON.stringify({ files: [] }), env: cleanEnv(),
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /demo rollback baseline is disabled/);
+  assert.doesNotMatch(result.stdout, /PASS/);
 });
 
 // F3: the rollback baseline itself must pass the exact live checks before

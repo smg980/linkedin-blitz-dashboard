@@ -69,7 +69,7 @@ test('F2: a live version listing any file outside the manifest fails', { timeout
   assertStoppedAfterDeploy(run, /Live version files or content hashes are not exactly the frozen manifest/);
 });
 
-test('F3: a rollback target with anything beyond the fictional demo files is refused before deploy', { timeout: 300000 }, async () => {
+test('F3: a rollback target with anything beyond the approved shell baseline is refused before deploy', { timeout: 300000 }, async () => {
   const run = await runDeploy({ mode: 'rollback-extra' });
   assertStoppedBeforeDeploy(run, /not a trustworthy baseline/);
 });

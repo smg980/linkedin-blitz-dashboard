@@ -15,6 +15,9 @@
 // applied, read the receipt and inspect, never re-run the same apply; 4 committed
 // but the owner record changed during the commit; 5 committed and verified but
 // the receipt could not record it. Read the receipt for 3-5.
+// R4: 10 + any of those (10, 11, 13, 14, 15) is the same outcome with cleanup
+// incomplete: the operator lock may still be held (or its release could not be
+// confirmed). The outcome is unchanged; never re-run the apply because of it.
 //
 // F4: production uses only the operator's gcloud user ADC file (checked, then
 // handed to the SDK explicitly) and requires it to belong to the account the
@@ -22,7 +25,6 @@
 // be outside the repository by path segment, real path and file identity.
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,6 +42,7 @@ import {
   StoreRefusal,
 } from '../secure/campaign-store.mjs';
 import { acquireOperatorLock, lockDirectory, LockRefusal } from '../secure/operator-lock.mjs';
+import { AnchoredDirectory, PrivatePathChanged, privateDirectoryInfo } from '../secure/anchored-dir.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const VALUE_FLAGS = new Set(['--target', '--project', '--input', '--expect-current', '--backup', '--receipt']);
@@ -131,7 +134,9 @@ async function resolveInput(file) {
 
 // A new private file: its directory's real path, outside the repository, and
 // no existing entry (file, directory or symlink) at the name.
-async function resolveNewPrivateFile(file, prefix) {
+// R6: the directory is then held open and every later file operation is
+// anchored to it (secure/anchored-dir.mjs); paths are never re-resolved.
+async function resolveNewPrivateFile(file, prefix, hooks) {
   const absolute = path.resolve(file);
   const name = path.basename(absolute);
   need(name !== '' && name !== '.' && name !== '..', `${prefix}_INSIDE_REPOSITORY`);
@@ -147,141 +152,84 @@ async function resolveNewPrivateFile(file, prefix) {
   need(privateDirectoryInfo(await fs.lstat(dir)), `${prefix}_DIRECTORY_NOT_PRIVATE`);
   const exists = await fs.lstat(target).then(() => true, () => false);
   need(!exists, `${prefix}_EXISTS`);
-  return target;
-}
-
-function privateDirectoryInfo(info) {
-  if (!info.isDirectory() || info.isSymbolicLink()) return false;
-  if (typeof process.getuid === 'function' && info.uid !== process.getuid()) return false;
-  return (info.mode & 0o077) === 0;
-}
-
-const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino;
-
-// R6: the backup/receipt directory was checked (real path outside the
-// repository, private) when the run started, but files are created later. If
-// the directory, or an ancestor, is swapped for a symlink in between, a
-// path-based open follows it. Node has no openat(2), so the file is created
-// empty with O_EXCL|O_NOFOLLOW and then proven, through its descriptor, to be
-// the only link to a new regular file inside the same, unchanged, still-private
-// directory at the same real path. Only then is anything written, and only
-// through that descriptor. Uses lstat/fstat/realpath only: macOS and Linux.
-// If the check fails, an empty file may remain wherever the swapped path
-// pointed; nothing else is written and the operation refuses.
-export class PrivatePathChanged extends Error {
-  constructor() {
-    super('PRIVATE_PATH_CHANGED');
-    this.code = 'PRIVATE_PATH_CHANGED';
-  }
-}
-
-export async function openNewPrivateFile(file, { read = false } = {}) {
-  const dir = path.dirname(file);
-  const before = await fs.lstat(dir);
-  if (!privateDirectoryInfo(before) || (await fs.realpath(dir)) !== dir) throw new PrivatePathChanged();
-  const { O_CREAT, O_EXCL, O_NOFOLLOW, O_WRONLY, O_RDWR } = fsConstants;
-  const handle = await fs.open(file, (read ? O_RDWR : O_WRONLY) | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+  let anchor;
   try {
-    const opened = await handle.stat();
-    const after = await fs.lstat(dir);
-    const atPath = await fs.lstat(file);
-    const ok = opened.isFile() && opened.nlink === 1 && opened.size === 0
-      && privateDirectoryInfo(after) && sameFile(after, before)
-      && (await fs.realpath(dir)) === dir
-      && atPath.isFile() && sameFile(atPath, opened);
-    if (!ok) throw new PrivatePathChanged();
-    return handle;
-  } catch (error) {
-    await handle.close().catch(() => {});
-    throw error instanceof PrivatePathChanged ? error : new PrivatePathChanged();
+    anchor = await AnchoredDirectory.open(dir, {
+      isOutside: (real) => assertOutsideRepository(path.join(real, name), `${prefix}_INSIDE_REPOSITORY`),
+      hooks,
+    });
+  } catch {
+    throw new StoreRefusal(`${prefix}_DIRECTORY_CHANGED`);
   }
+  return { target, name, anchor };
 }
 
-// After an atomic rename into the checked directory: the name must now be the
-// file we wrote, in the same unchanged directory.
-async function assertRenamedInPlace(file, written, dirBefore) {
-  const dir = path.dirname(file);
-  const after = await fs.lstat(dir);
-  const atPath = await fs.lstat(file);
-  if (!(privateDirectoryInfo(after) && sameFile(after, dirBefore) && (await fs.realpath(dir)) === dir
-    && atPath.isFile() && sameFile(atPath, written) && atPath.nlink === 1)) throw new PrivatePathChanged();
+export { PrivatePathChanged };
+
+function backupText(envelope) {
+  return `${JSON.stringify(envelope)}\n`;
 }
 
-function resolveBackup(file) {
-  return resolveNewPrivateFile(file, 'STORE_BACKUP');
+function receiptText(body) {
+  return `${JSON.stringify(body, null, 2)}\n`;
 }
 
-function resolveReceipt(file) {
-  return resolveNewPrivateFile(file, 'STORE_RECEIPT');
+function tempName(name) {
+  return `${name}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
 }
 
-async function syncDirectory(dir) {
-  const handle = await fs.open(dir, 'r');
-  try { await handle.sync(); } finally { await handle.close(); }
+// R6: writers bound to directories anchored when the run started. A path that
+// is not the one resolved then is refused; nothing is resolved again.
+export function anchoredWriters({ backup, receipt }) {
+  const bound = (entry, file) => {
+    if (!entry || file !== entry.target) throw new PrivatePathChanged();
+    return entry;
+  };
+  return {
+    backup: {
+      async write(file, envelope) {
+        const { anchor, name } = bound(backup, file);
+        const back = await anchor.createWithContent(name, backupText(envelope), { readBack: true });
+        return envelopeDigest(parseEnvelopeText(back.toString('utf8')));
+      },
+    },
+    receipt: {
+      async create(file, body) {
+        const { anchor, name } = bound(receipt, file);
+        await anchor.createWithContent(name, receiptText(body));
+      },
+      async update(file, body) {
+        const { anchor, name } = bound(receipt, file);
+        await anchor.replaceWithContent(name, tempName(name), receiptText(body));
+      },
+    },
+  };
 }
 
-// F6: the receipt is created exclusively (mode 600) and flushed before any
-// mutation; every update replaces it atomically and is flushed too.
-// R6: every file is created through openNewPrivateFile and written only
-// through the verified descriptor.
-async function writeVerified(handle, text) {
-  const data = Buffer.from(text, 'utf8');
-  let offset = 0;
-  while (offset < data.length) {
-    const { bytesWritten } = await handle.write(data, offset, data.length - offset, offset);
-    offset += bytesWritten;
-  }
-  await handle.sync();
-}
-
-export async function createReceiptFile(file, body) {
-  const handle = await openNewPrivateFile(file);
+// Stand-alone forms (one anchored operation each), same checks as a run.
+async function withAnchor(file, prefix, fn) {
+  const entry = await resolveNewPrivateFile(file, prefix);
   try {
-    await writeVerified(handle, `${JSON.stringify(body, null, 2)}\n`);
+    return await fn(entry);
   } finally {
-    await handle.close();
+    await entry.anchor.close();
   }
-  await syncDirectory(path.dirname(file));
-}
-
-export async function updateReceiptFile(file, body) {
-  const dirBefore = await fs.lstat(path.dirname(file));
-  const temp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
-  const handle = await openNewPrivateFile(temp);
-  let written;
-  try {
-    await writeVerified(handle, `${JSON.stringify(body, null, 2)}\n`);
-    written = await handle.stat();
-  } finally {
-    await handle.close();
-  }
-  if (!sameFile(await fs.lstat(path.dirname(temp)), dirBefore)) throw new PrivatePathChanged();
-  await fs.rename(temp, file);
-  await assertRenamedInPlace(file, written, dirBefore);
-  await syncDirectory(path.dirname(file));
 }
 
 // Exclusive create, mode 600, then re-read through the same descriptor: the
-// digest proves what is on disk at the verified location.
+// digest proves what is on disk at the anchored location.
 export async function writeBackupFile(file, envelope) {
-  const handle = await openNewPrivateFile(file, { read: true });
-  let text;
-  try {
-    await writeVerified(handle, `${JSON.stringify(envelope)}\n`);
-    const { size } = await handle.stat();
-    const buffer = Buffer.alloc(size);
-    let offset = 0;
-    while (offset < size) {
-      const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
-      if (bytesRead === 0) break;
-      offset += bytesRead;
-    }
-    text = buffer.subarray(0, offset).toString('utf8');
-  } finally {
-    await handle.close();
-  }
-  await syncDirectory(path.dirname(file));
-  return envelopeDigest(parseEnvelopeText(text));
+  const absolute = path.resolve(file);
+  // EEXIST is reported as such (never an overwrite).
+  if (await fs.lstat(absolute).then(() => true, () => false)) throw Object.assign(new Error('EEXIST: backup exists'), { code: 'EEXIST' });
+  return withAnchor(absolute, 'STORE_BACKUP', async ({ anchor, name }) => {
+    const back = await anchor.createWithContent(name, backupText(envelope), { readBack: true });
+    return envelopeDigest(parseEnvelopeText(back.toString('utf8')));
+  });
+}
+
+export async function createReceiptFile(file, body) {
+  return withAnchor(path.resolve(file), 'STORE_RECEIPT', ({ anchor, name }) => anchor.createWithContent(name, receiptText(body)));
 }
 
 // F4: the gcloud user ADC file, from gcloud's own configuration directory.
@@ -343,10 +291,30 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
   campaignPath(uid);
   if (opts.action === 'write') need(opts.input, 'STORE_INPUT_REQUIRED');
   const input = opts.action === 'write' ? await resolveInput(opts.input) : null;
-  const backupPath = opts.backup && opts.apply ? await resolveBackup(opts.backup) : opts.backup;
-  if (opts.apply) need(opts.receipt, 'STORE_RECEIPT_REQUIRED');
-  const receiptPath = opts.apply ? await resolveReceipt(opts.receipt) : undefined;
-  if (receiptPath && backupPath) need(receiptPath !== backupPath, 'STORE_RECEIPT_EXISTS');
+  // R6: both directories are anchored now and held for the whole run.
+  const anchors = [];
+  let backupEntry = null;
+  let receiptEntry = null;
+  try {
+    if (opts.backup && opts.apply) anchors.push(backupEntry = await resolveNewPrivateFile(opts.backup, 'STORE_BACKUP', deps.privateFileHooks));
+    if (opts.apply) need(opts.receipt, 'STORE_RECEIPT_REQUIRED');
+    if (opts.apply) anchors.push(receiptEntry = await resolveNewPrivateFile(opts.receipt, 'STORE_RECEIPT', deps.privateFileHooks));
+    if (receiptEntry && backupEntry) need(receiptEntry.target !== backupEntry.target, 'STORE_RECEIPT_EXISTS');
+  } catch (error) {
+    for (const entry of anchors) await entry.anchor.close();
+    throw error;
+  }
+  try {
+    return await runWithAnchors({ opts, env, deps, input, uid, backupEntry, receiptEntry });
+  } finally {
+    for (const entry of anchors) await entry.anchor.close();
+  }
+}
+
+async function runWithAnchors({ opts, env, deps, input, uid, backupEntry, receiptEntry }) {
+  const backupPath = backupEntry ? backupEntry.target : opts.backup;
+  const receiptPath = receiptEntry ? receiptEntry.target : undefined;
+  const writers = anchoredWriters({ backup: backupEntry, receipt: receiptEntry });
 
   // Coordinated operator control: no claim tool or second store run may
   // overlap a mutation for this project.
@@ -365,8 +333,10 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
     try {
       await assertOutsideRepository(path.dirname(lock.file), 'STORE_LOCK_INSIDE_REPOSITORY');
     } catch (error) {
-      await runCleanup([() => lock.release()]);
-      throw error;
+      const failures = await runCleanupSteps([['LOCK_RELEASE', () => lock.release()]]);
+      const refusal = error instanceof StoreRefusal ? error : new StoreRefusal('STORE_LOCK_INSIDE_REPOSITORY');
+      if (failures.length) Object.assign(refusal, { cleanupComplete: false, cleanupFailures: failures });
+      throw refusal;
     }
   }
   let app;
@@ -395,8 +365,8 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
     const result = await runStoreAction({
       db: firestore,
       auth: getAuth(app),
-      backup: { write: writeBackupFile },
-      receipt: { create: createReceiptFile, update: updateReceiptFile },
+      backup: writers.backup,
+      receipt: writers.receipt,
       target: opts.target,
       projectId: opts.project,
       action: opts.action,
@@ -422,41 +392,53 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
     outcome = { error: error instanceof StoreRefusal ? error : new StoreRefusal('STORE_OPERATION_FAILED') };
   }
   // R4: cleanup never decides the outcome. Each step is attempted, bounded and
-  // contained; a failure is reported alongside the outcome, never instead of it.
-  const cleanupComplete = await runCleanup([
-    firestore && (() => firestore.terminate()),
-    app && (() => deleteApp(app)),
-    lock && (() => lock.release()),
+  // contained; a failure is reported alongside the outcome, never instead of it,
+  // and never as complete success (see completionExitCode).
+  const cleanupFailures = await runCleanupSteps([
+    firestore && ['FIRESTORE_TERMINATE', () => firestore.terminate()],
+    app && ['APP_DELETE', () => deleteApp(app)],
+    lock && ['LOCK_RELEASE', () => lock.release()],
   ]);
   if (outcome.error) {
-    if (!cleanupComplete) outcome.error.cleanupComplete = false;
+    if (cleanupFailures.length) Object.assign(outcome.error, { cleanupComplete: false, cleanupFailures });
     throw outcome.error;
   }
-  return cleanupComplete ? outcome.result : { ...outcome.result, cleanupComplete: false };
+  return cleanupFailures.length ? { ...outcome.result, cleanupComplete: false, cleanupFailures } : outcome.result;
 }
 
 const CLEANUP_STEP_MS = 3000;
+// Fixed codes only: errors can carry paths or SDK text and are never printed.
+const LOCK_FAILURE = /^LOCK_RELEASE_[A-Z_]+$/;
 
-// Runs every step even if an earlier one fails or hangs. Returns whether all
-// completed. Errors are dropped: they can carry paths or SDK text.
-export async function runCleanup(steps) {
-  let complete = true;
-  for (const step of steps) {
-    if (!step) continue;
+// Runs every [name, step] even if an earlier one fails or hangs, and returns
+// the fixed codes of those that did not complete (empty: all completed). A lock
+// release that throws one of operator-lock's LOCK_RELEASE_* codes keeps that code.
+export async function runCleanupSteps(steps) {
+  const failures = [];
+  for (const entry of steps) {
+    if (!entry) continue;
+    const [name, step] = entry;
     let timer;
     try {
       const finished = await Promise.race([
         Promise.resolve().then(step).then(() => true),
         new Promise((resolve) => { timer = setTimeout(() => resolve(false), CLEANUP_STEP_MS); }),
       ]);
-      if (!finished) complete = false;
-    } catch {
-      complete = false;
+      if (!finished) failures.push(`${name}_TIMEOUT`);
+    } catch (error) {
+      const code = error instanceof LockRefusal && LOCK_FAILURE.test(error.code) ? error.code : `${name}_FAILED`;
+      failures.push(code);
     } finally {
       clearTimeout(timer);
     }
   }
-  return complete;
+  return failures;
+}
+
+// Boolean form, kept for callers that only need complete/incomplete.
+export async function runCleanup(steps) {
+  const failures = await runCleanupSteps(steps.map((step, index) => step && [`STEP_${index}`, step]));
+  return failures.length === 0;
 }
 
 // 1 is the only code that means nothing was written. Every other non-zero code
@@ -468,18 +450,43 @@ export function exitCodeFor(error) {
   return 1;
 }
 
+// R4: the process exit code. Cleanup that did not complete (for example an
+// operator lock that may still be held) adds 10, so it is never 0 and never
+// equal to the same outcome with clean cleanup: 10 completed, 11 refused,
+// 13 unknown, 14 eligibility changed, 15 receipt failed after commit.
+export const CLEANUP_INCOMPLETE_OFFSET = 10;
+export function completionExitCode({ result, error } = {}) {
+  if (error !== undefined) {
+    const base = error instanceof StoreRefusal ? exitCodeFor(error) : 1;
+    return error?.cleanupComplete === false ? base + CLEANUP_INCOMPLETE_OFFSET : base;
+  }
+  return result?.cleanupComplete === false ? CLEANUP_INCOMPLETE_OFFSET : 0;
+}
+
+function cleanupSuffix(failures) {
+  const codes = Array.isArray(failures) ? failures.filter((code) => /^[A-Z0-9_]{1,64}$/.test(code)) : [];
+  return codes.length ? ` ${codes.join(' ')}` : '';
+}
+
 export function failureLine(error) {
   const code = error instanceof StoreRefusal ? error.code : 'STORE_OPERATION_FAILED';
-  const cleanup = error?.cleanupComplete === false ? ' CLEANUP_INCOMPLETE' : '';
+  const cleanup = error?.cleanupComplete === false ? ` CLEANUP_INCOMPLETE${cleanupSuffix(error.cleanupFailures)}` : '';
   return `${exitCodeFor(error) === 1 ? 'STORE_REFUSED' : 'STORE_UNRESOLVED'} ${code}${cleanup}`;
+}
+
+// R4: printed on stderr beside a successful JSON result whose cleanup did not
+// complete. The outcome on stdout stands; the run did not finish cleanly.
+export function cleanupIncompleteLine(result) {
+  return `STORE_CLEANUP_INCOMPLETE${cleanupSuffix(result?.cleanupFailures)} outcome=${/^[a-z-]{1,40}$/.test(result?.outcome || '') ? result.outcome : (result?.dryRun ? 'dry-run' : 'unreported')} do-not-rerun-apply`;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().then((result) => {
     console.log(JSON.stringify(result));
-    process.exit(0);
+    if (result?.cleanupComplete === false) console.error(cleanupIncompleteLine(result));
+    process.exit(completionExitCode({ result }));
   }).catch((error) => {
     console.error(failureLine(error));
-    process.exit(error instanceof StoreRefusal ? exitCodeFor(error) : 1);
+    process.exit(completionExitCode({ error }));
   });
 }

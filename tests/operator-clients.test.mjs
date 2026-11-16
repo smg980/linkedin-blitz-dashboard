@@ -30,15 +30,15 @@ const PASS = 'synthetic-operator-clients-passphrase';
 const envelope = await encryptEnvelope(syntheticPayload(), PASS);
 const digest = envelopeDigest(envelope);
 
-async function tempDir(prefix) {
-  return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+async function tempDir(prefix, root = os.tmpdir()) {
+  return fs.realpath(await fs.mkdtemp(path.join(root, prefix)));
 }
 
-async function harness({ commitFault, initialFields, onBatchGet } = {}) {
+async function harness({ commitFault, initialFields, onBatchGet, workRoot } = {}) {
   const firestore = await startFirestoreServer({ tls: TLS, commitFault, initialFields, onBatchGet });
   const identity = await startIdentityToolkit({ tls: TLS, user: syntheticOwnerRecord(UID) });
   const tokens = tokenTransporter();
-  const work = await tempDir('blitz-r3-');
+  const work = await tempDir('blitz-r3-', workRoot);
   const lockDir = path.join(work, 'lock');
   const tokenInfoCalls = [];
   const deps = {
@@ -161,7 +161,7 @@ test('R5: production and emulator Firestore settings disable Commit and channel 
 // R4: cleanup (lock release, client shutdown) runs in `finally`. A cleanup
 // failure must never replace a committed or unknown outcome with a refusal.
 const { acquireOperatorLock } = await import('../secure/operator-lock.mjs');
-const { exitCodeFor, failureLine } = await import('../scripts/blitz-campaign-store.mjs');
+const { completionExitCode, exitCodeFor, failureLine } = await import('../scripts/blitz-campaign-store.mjs');
 const failingRelease = (released) => async (options) => {
   const lock = await acquireOperatorLock(options);
   return {
@@ -186,6 +186,8 @@ test('R4: a cleanup failure after a verified commit keeps the committed outcome'
     assert.ok(outcome.result, `committed run must not surface as ${outcome.error?.code ?? outcome.error}`);
     assert.equal(outcome.result.outcome, 'committed-verified');
     assert.equal(outcome.result.cleanupComplete, false);
+    assert.deepEqual(outcome.result.cleanupFailures, ['LOCK_RELEASE_FAILED']);
+    assert.equal(completionExitCode(outcome), 10, 'never the success exit');
   } finally {
     await h.close();
   }
@@ -203,7 +205,8 @@ test('R4: a cleanup failure after an unresolved commit keeps STORE_OUTCOME_UNKNO
     assert.ok(error instanceof StoreRefusal, `got ${error}`);
     assert.equal(error.code, 'STORE_OUTCOME_UNKNOWN');
     assert.equal(exitCodeFor(error), 3);
-    assert.match(failureLine(error), /^STORE_UNRESOLVED STORE_OUTCOME_UNKNOWN CLEANUP_INCOMPLETE$/);
+    assert.equal(completionExitCode({ error }), 13);
+    assert.match(failureLine(error), /^STORE_UNRESOLVED STORE_OUTCOME_UNKNOWN CLEANUP_INCOMPLETE LOCK_RELEASE_FAILED$/);
   } finally {
     await h.close();
   }
@@ -219,11 +222,156 @@ test('R4: a cleanup failure after a refusal stays a refusal and leaks nothing', 
     assert.equal(released.length, 1);
     assert.equal(error.code, 'STORE_APPROVAL_REQUIRED');
     assert.equal(exitCodeFor(error), 1);
+    assert.equal(completionExitCode({ error }), 11);
     assert.doesNotMatch(failureLine(error), /EIO|private/);
     assert.equal(h.firestore.state.commits.length, 0);
   } finally {
     await h.close();
   }
+});
+
+// R4 (Codex f82bb16): the lock is genuinely retained or unverifiable. These use
+// the real acquireOperatorLock and inject failures into the real filesystem
+// calls release() makes (its in-process `io` seam), so the lock file on disk is
+// really left behind. A leftover lock is conservative, but the run must not
+// signal complete success, and the mutation outcome must be preserved.
+const realFs = fs;
+const ioFault = (fault) => ({
+  lstat: (...a) => (fault.lstat ? fault.lstat(...a) : realFs.lstat(...a)),
+  readFile: (...a) => (fault.readFile ? fault.readFile(...a) : realFs.readFile(...a)),
+  unlink: (...a) => (fault.unlink ? fault.unlink(...a) : realFs.unlink(...a)),
+});
+const eio = (what) => async () => { throw Object.assign(new Error(`EIO: synthetic ${what} /private/path`), { code: 'EIO' }); };
+const lockWithIo = (fault, seen) => async (options) => {
+  const lock = await acquireOperatorLock({ ...options, io: ioFault(fault) });
+  seen.file = lock.file;
+  return lock;
+};
+const lockStillHeld = async (seen) => realFs.lstat(seen.file).then((i) => i.isFile(), () => false);
+
+for (const [label, fault, code] of [
+  ['unlink fails (the lock stays held)', { unlink: eio('unlink') }, 'LOCK_RELEASE_UNLINK_FAILED'],
+  ['the lock cannot be read (EIO)', { readFile: eio('read') }, 'LOCK_RELEASE_UNREADABLE'],
+  ['the lock cannot be stat-ed (EIO)', { lstat: eio('lstat') }, 'LOCK_RELEASE_UNREADABLE'],
+]) {
+  test(`R4: committed-verified when ${label}: outcome kept, exit 10, lock left, fixed code`, { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+    const h = await harness();
+    try {
+      const seen = {};
+      const receipt = path.join(h.work, 'receipt.json');
+      const result = await main(writeArgs(h, receipt), writeEnv(h), { ...h.deps, acquireOperatorLock: lockWithIo(fault, seen) });
+      assert.equal(result.outcome, 'committed-verified');
+      assert.equal(result.cleanupComplete, false);
+      assert.deepEqual(result.cleanupFailures, [code]);
+      assert.equal(completionExitCode({ result }), 10);
+      assert.equal(h.firestore.state.commits.length, 1);
+      assert.equal(JSON.parse(await fs.readFile(receipt, 'utf8')).status, 'COMMITTED_VERIFIED');
+      assert.equal(await lockStillHeld(seen), true, 'the real lock file is still present');
+      assert.doesNotMatch(JSON.stringify(result), /EIO|private/);
+      // The retained lock fails closed for the next run.
+      const again = await main(writeArgs(h, path.join(h.work, 'receipt-2.json')), writeEnv(h), h.deps).catch((e) => e);
+      assert.equal(again.code, 'STORE_OPERATOR_LOCK_HELD');
+      assert.equal(h.firestore.state.commits.length, 1);
+    } finally {
+      await h.close();
+    }
+  });
+}
+
+test('R4: an unknown outcome with an unreadable lock stays STORE_OUTCOME_UNKNOWN (exit 13), receipt OUTCOME_UNKNOWN', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  let grpcStatus;
+  const h = await harness({ commitFault: (attempt, request, apply) => { apply(); return { code: grpcStatus.UNAVAILABLE, details: 'synthetic' }; } });
+  grpcStatus = h.firestore.grpcStatus;
+  try {
+    const seen = {};
+    const receipt = path.join(h.work, 'receipt.json');
+    const error = await main(writeArgs(h, receipt), writeEnv(h), { ...h.deps, acquireOperatorLock: lockWithIo({ readFile: eio('read') }, seen) }).catch((e) => e);
+    assert.ok(error instanceof StoreRefusal);
+    assert.equal(error.code, 'STORE_OUTCOME_UNKNOWN');
+    assert.equal(error.outcome, 'unknown');
+    assert.deepEqual(error.cleanupFailures, ['LOCK_RELEASE_UNREADABLE']);
+    assert.equal(completionExitCode({ error }), 13);
+    assert.equal(failureLine(error), 'STORE_UNRESOLVED STORE_OUTCOME_UNKNOWN CLEANUP_INCOMPLETE LOCK_RELEASE_UNREADABLE');
+    assert.equal(JSON.parse(await fs.readFile(receipt, 'utf8')).status, 'OUTCOME_UNKNOWN');
+    assert.equal(h.firestore.state.commits.length, 1);
+    assert.equal(await lockStillHeld(seen), true);
+  } finally {
+    await h.close();
+  }
+});
+
+test('R4: a pre-write refusal with a failed unlink stays a refusal (exit 11), nothing written', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  const h = await harness();
+  try {
+    const seen = {};
+    const env = { ...writeEnv(h), BLITZ_STORE_APPROVAL: 'WRITE:wrong' };
+    const error = await main(writeArgs(h, path.join(h.work, 'receipt.json')), env, { ...h.deps, acquireOperatorLock: lockWithIo({ unlink: eio('unlink') }, seen) }).catch((e) => e);
+    assert.equal(error.code, 'STORE_APPROVAL_REQUIRED');
+    assert.equal(completionExitCode({ error }), 11);
+    assert.equal(failureLine(error), 'STORE_REFUSED STORE_APPROVAL_REQUIRED CLEANUP_INCOMPLETE LOCK_RELEASE_UNLINK_FAILED');
+    assert.equal(h.firestore.state.commits.length, 0);
+    assert.equal(await lockStillHeld(seen), true);
+  } finally {
+    await h.close();
+  }
+});
+
+for (const [label, tamper, code, held] of [
+  ['removed by someone else', async (file) => realFs.unlink(file), 'LOCK_RELEASE_MISSING', false],
+  ['replaced by another holder', async (file) => { await realFs.unlink(file); await realFs.writeFile(file, '{"nonce":"someone-else"}\n', { mode: 0o600 }); }, 'LOCK_RELEASE_NOT_OWNED', true],
+  ['rewritten in place with another nonce', async (file) => realFs.writeFile(file, '{"nonce":"someone-else"}\n'), 'LOCK_RELEASE_NOT_OWNED', true],
+]) {
+  test(`R4: a lock ${label} during the run is never reported as released`, { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+    const h = await harness();
+    try {
+      const seen = {};
+      const deps = { ...h.deps, acquireOperatorLock: async (options) => {
+        const lock = await acquireOperatorLock(options);
+        seen.file = lock.file;
+        return { file: lock.file, release: async () => { await tamper(lock.file); return lock.release(); } };
+      } };
+      const result = await main(writeArgs(h, path.join(h.work, 'receipt.json')), writeEnv(h), deps);
+      assert.equal(result.outcome, 'committed-verified');
+      assert.deepEqual(result.cleanupFailures, [code]);
+      assert.equal(completionExitCode({ result }), 10);
+      assert.equal(await lockStillHeld(seen), held, 'another holder\'s lock is never removed');
+    } finally {
+      await h.close();
+    }
+  });
+}
+
+test('R4: a clean run exits 0 and leaves no lock', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  const h = await harness();
+  try {
+    const seen = {};
+    const result = await main(writeArgs(h, path.join(h.work, 'receipt.json')), writeEnv(h), { ...h.deps, acquireOperatorLock: lockWithIo({}, seen) });
+    assert.equal(result.outcome, 'committed-verified');
+    assert.equal(result.cleanupComplete, undefined);
+    assert.equal(completionExitCode({ result }), 0);
+    assert.equal(await lockStillHeld(seen), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test('R4: the CLI exits only through completionExitCode, never an unconditional 0', async () => {
+  const source = await fs.readFile(new URL('../scripts/blitz-campaign-store.mjs', import.meta.url), 'utf8');
+  const cli = source.slice(source.lastIndexOf('if (process.argv[1]'));
+  assert.doesNotMatch(cli, /process\.exit\(\s*0\s*\)/);
+  assert.equal([...cli.matchAll(/process\.exit\(completionExitCode\(\{ (result|error) \}\)\)/g)].length, 2);
+  assert.match(cli, /cleanupIncompleteLine\(result\)/);
+});
+
+test('R4: completion exit codes are distinct for every outcome with and without cleanup', () => {
+  const err = (outcome, cleanupComplete) => Object.assign(new StoreRefusal('X'), outcome ? { outcome } : {}, cleanupComplete === false ? { cleanupComplete } : {});
+  const codes = [
+    completionExitCode({ result: {} }), completionExitCode({ result: { cleanupComplete: false } }),
+    ...[undefined, 'unknown', 'committed-eligibility-changed', 'committed-verified'].flatMap((o) => [completionExitCode({ error: err(o) }), completionExitCode({ error: err(o, false) })]),
+  ];
+  assert.deepEqual(codes, [0, 10, 1, 11, 3, 13, 4, 14, 5, 15]);
+  assert.equal(new Set(codes).size, codes.length);
+  assert.equal(completionExitCode({ error: new Error('x') }), 1);
 });
 
 test('R4: runCleanup attempts every step, bounds a hanging one and reports incompleteness', async () => {
@@ -356,5 +504,221 @@ test('R6: backup and receipt directories must be private to the operator', R6, a
     assert.equal(h.firestore.state.commits.length, 0);
   } finally {
     await h.close();
+  }
+});
+
+// R6 (Codex f82bb16): the descriptor proof raced the path-based open. A parent
+// swapped into the repository just before open, then restored, with a hard link
+// planted after the first fstat, let 3,580 bytes of fictional ciphertext be
+// written into the repository. Every file operation is now anchored to the
+// directory held open since the run started (secure/anchored-dir.mjs). These
+// hooks run real renames, symlinks and links at the actual await boundaries of
+// the anchored create/write/rename; no stat result or writer is replaced.
+// The private directory sits beside the repository (same filesystem) so hard
+// links and renames into the repository are really possible.
+const PARENT = path.dirname(REPO);
+const R6B = { skip: !HAVE_OPENSSL && 'openssl unavailable', timeout: 60000 };
+
+async function boundaryRun({ hooks, initial = true, input: inputEnvelope = envB }) {
+  const target = await swapTarget();
+  const h = await harness({ initialFields: initial ? encodeFields(envelope) : undefined, workRoot: PARENT });
+  assert.equal((await fs.stat(h.work)).dev, (await fs.stat(target)).dev, 'precondition: private dir and repository share a filesystem');
+  const backupDir = path.join(h.work, 'backup-dir');
+  const receiptDir = path.join(h.work, 'receipt-dir');
+  await fs.mkdir(backupDir, { mode: 0o700 });
+  await fs.mkdir(receiptDir, { mode: 0o700 });
+  const input = path.join(h.work, 'envelope-b.json');
+  await fs.writeFile(input, JSON.stringify(inputEnvelope));
+  const ctx = { h, target, backupDir, receiptDir, backupFile: path.join(backupDir, 'backup.json'), receiptFile: path.join(receiptDir, 'receipt.json') };
+  const args = ['write', '--target', 'production', '--project', PRODUCTION_PROJECT, '--input', input,
+    '--expect-current', initial ? digest : 'none', '--receipt', ctx.receiptFile, '--apply',
+    ...(initial ? ['--backup', ctx.backupFile] : [])];
+  const env = { ...writeEnv(h), BLITZ_STORE_APPROVAL: `WRITE:${envelopeDigest(inputEnvelope)}` };
+  const outcome = await main(args, env, { ...h.deps, privateFileHooks: hooks(ctx) }).then((result) => ({ result }), (error) => ({ error }));
+  ctx.outcome = outcome;
+  ctx.leaked = await filesUnder(target);
+  return ctx;
+}
+
+async function finish(ctx) {
+  await fs.rm(ctx.target, { recursive: true, force: true });
+  await ctx.h.close();
+}
+
+function assertNothingInRepository(ctx) {
+  assert.deepEqual(ctx.leaked.filter((f) => f.size > 0).map((f) => `${f.name}:${f.size}`), [], 'no content inside the repository');
+  assert.ok(!ctx.leaked.some((f) => f.text.includes(envelope.ct) || f.text.includes('uidSha256')), 'no ciphertext or receipt inside the repository');
+}
+
+// Runs `fn` once, at the first call of a boundary for the named file.
+const once = (file, fn) => {
+  let done = false;
+  return async (detail) => {
+    if (done || detail?.name !== file) return;
+    done = true;
+    await fn(detail);
+  };
+};
+
+test('R6: Codex sequence — parent swapped into the repository before the open, restored, hard link after the first fstat: no repository content, no commit', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => {
+    const repoFile = path.join(c.target, 'backup.json');
+    return {
+      afterAnchor: async () => {
+        if (c.swapped || !(await fs.lstat(c.backupDir).then(() => true, () => false))) return;
+        if (c.h.firestore.state.commits.length) return;
+        // Only on the backup's anchored section: the receipt was created first.
+        if (!(await fs.lstat(c.receiptFile).then(() => true, () => false))) return;
+        c.swapped = true;
+        await fs.rename(c.backupDir, `${c.backupDir}.moved`);
+        await fs.symlink(c.target, c.backupDir, 'dir');
+      },
+      afterFirstFstat: once('backup.json', async ({ opened }) => {
+        assert.equal(opened.nlink, 1);
+        await fs.unlink(c.backupDir);
+        await fs.rename(`${c.backupDir}.moved`, c.backupDir);
+        // The anchored create landed in the private directory; link it into the repository.
+        await fs.link(c.backupFile, repoFile);
+      }),
+    };
+  } });
+  try {
+    assert.equal(ctx.swapped, true, 'the swap happened');
+    assertNothingInRepository(ctx);
+    assert.deepEqual(ctx.leaked.map((f) => f.name), ['backup.json'], 'only the empty linked artifact');
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.code, 'STORE_BACKUP_FAILED');
+    assert.equal(ctx.outcome.error?.outcome, 'refused-before-write');
+    assert.equal((await fs.stat(ctx.backupFile)).size, 0, 'nothing was written');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: a hard link into the repository planted after the pre-write check is emptied after the write; no commit', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    beforeWrite: once('backup.json', async () => { await fs.link(c.backupFile, path.join(c.target, 'backup.json')); }),
+  }) });
+  try {
+    assert.deepEqual(ctx.leaked.map((f) => `${f.name}:${f.size}`), ['backup.json:0'], 'the planted link holds zero bytes');
+    assertNothingInRepository(ctx);
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.code, 'STORE_BACKUP_FAILED');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: the anchored directory moved into the repository during the write is emptied and refused; no commit', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    beforeWrite: once('backup.json', async () => { await fs.rename(c.backupDir, path.join(c.target, 'moved-private-dir')); }),
+  }) });
+  try {
+    const moved = await filesUnder(path.join(ctx.target, 'moved-private-dir'));
+    assert.deepEqual(moved.map((f) => `${f.name}:${f.size}`), ['backup.json:0']);
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.code, 'STORE_BACKUP_FAILED');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: the directory path swapped into the repository after anchoring cannot redirect create, write or rename', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    afterCreate: once('receipt.json', async () => {
+      await fs.rename(c.receiptDir, `${c.receiptDir}.moved`);
+      await fs.symlink(c.target, c.receiptDir, 'dir');
+    }),
+  }) });
+  try {
+    assertNothingInRepository(ctx);
+    assert.deepEqual(ctx.leaked, []);
+    // The receipt was created in the held directory object, now named .moved;
+    // later sections re-enter by path, find another directory and refuse.
+    assert.ok((await fs.stat(path.join(`${ctx.receiptDir}.moved`, 'receipt.json'))).size > 0);
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.outcome, 'refused-before-write');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: receipt replacement — a link planted on the temp file before the rename is emptied; the commit is still reported (exit 5)', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => {
+    return {
+      beforeRename: async ({ tempName }) => {
+        if (!c.h.firestore.state.commits.length || c.linked) return;
+        c.linked = true;
+        await fs.link(path.join(c.receiptDir, tempName), path.join(c.target, 'receipt.json'));
+      },
+    };
+  } });
+  try {
+    assert.equal(ctx.linked, true);
+    assertNothingInRepository(ctx);
+    assert.equal(ctx.h.firestore.state.commits.length, 1);
+    assert.equal(ctx.outcome.error?.code, 'STORE_RECEIPT_FAILED_AFTER_COMMIT');
+    assert.equal(ctx.outcome.error?.outcome, 'committed-verified');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: receipt replacement — a path swap at the rename boundary keeps the rename inside the held directory', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    beforeRename: async () => {
+      if (!c.h.firestore.state.commits.length || c.swapped) return;
+      c.swapped = true;
+      await fs.rename(c.receiptDir, `${c.receiptDir}.moved`);
+      await fs.symlink(c.target, c.receiptDir, 'dir');
+    },
+  }) });
+  try {
+    assert.equal(ctx.swapped, true);
+    assert.deepEqual(ctx.leaked, [], 'the rename never reached the repository');
+    assert.equal(JSON.parse(await fs.readFile(path.join(`${ctx.receiptDir}.moved`, 'receipt.json'), 'utf8')).status, 'COMMITTED_VERIFIED');
+    assert.equal(ctx.h.firestore.state.commits.length, 1);
+    assert.equal(ctx.outcome.result?.outcome, 'committed-verified');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: an entry planted at the anchored name is never followed or overwritten', R6B, async () => {
+  const victim = path.join(REPO, '.r6-victim-');
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    afterAnchor: async () => {
+      if (c.planted || !(await fs.lstat(c.receiptFile).then(() => true, () => false)) || c.h.firestore.state.commits.length) return;
+      c.planted = true;
+      c.victim = await fs.mkdtemp(victim);
+      await fs.writeFile(path.join(c.victim, 'tracked.txt'), 'original\n');
+      await fs.symlink(path.join(c.victim, 'tracked.txt'), c.backupFile);
+    },
+  }) });
+  try {
+    assert.equal(ctx.planted, true);
+    assert.equal(await fs.readFile(path.join(ctx.victim, 'tracked.txt'), 'utf8'), 'original\n');
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.code, 'STORE_BACKUP_FAILED');
+  } finally {
+    await fs.rm(ctx.victim, { recursive: true, force: true });
+    await finish(ctx);
+  }
+});
+
+test('R6: a clean run through the anchored writers leaves the exact backup and receipt and restores the working directory', R6B, async () => {
+  const cwd = process.cwd();
+  const ctx = await boundaryRun({ hooks: () => ({}) });
+  try {
+    assert.equal(process.cwd(), cwd);
+    assert.equal(ctx.outcome.result?.outcome, 'committed-verified');
+    assert.equal(ctx.outcome.result?.backupWritten, true);
+    assert.equal(envelopeDigest(JSON.parse(await fs.readFile(ctx.backupFile, 'utf8'))), digest);
+    assert.equal((await fs.stat(ctx.backupFile)).mode & 0o777, 0o600);
+    assert.equal(JSON.parse(await fs.readFile(ctx.receiptFile, 'utf8')).status, 'COMMITTED_VERIFIED');
+    assert.deepEqual((await fs.readdir(ctx.receiptDir)).sort(), ['receipt.json'], 'no temp file left');
+    assert.deepEqual(ctx.leaked, []);
+  } finally {
+    await finish(ctx);
   }
 });
