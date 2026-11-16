@@ -174,3 +174,29 @@ test('the shell page must carry the exact CSP and load only config.js and shell.
     for (const [text, pattern] of cases) assert.throws(() => assertShellHtml(text), pattern);
   });
 });
+
+// R1: the Hosting API names files by the SHA-256 of the CLI's gzip stream, not
+// of the bytes. The oracle is the pinned firebase-tools Uploader itself.
+test('R1: hostingFileHash equals the pinned Firebase CLI upload hash for every shell file and multi-chunk files', async () => {
+  const { createRequire } = await import('node:module');
+  const { hostingFileHash } = await import('../scripts/secure-release.mjs');
+  const { Uploader } = createRequire(import.meta.url)('firebase-tools/lib/deploy/hosting/uploader.js');
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'blitz-hosting-hash-'));
+  try {
+    const pub = await productionBuild(dir);
+    const big = path.join(pub, 'big.bin');
+    // Several 64 KiB read-stream chunks of incompressible and repetitive data.
+    await writeFile(big, Buffer.concat([Buffer.from(Array.from({ length: 300000 }, (_, i) => (i * 7919) % 251)), Buffer.alloc(200000, 0x41)]));
+    const files = [...SECURE_SHELL_FILES, 'big.bin'];
+    const uploader = new Uploader({ version: 'sites/x/versions/y', public: pub, files, projectRoot: dir, cwd: dir });
+    for (const rel of files) {
+      await uploader.hashHandler(rel);
+      const cli = uploader.pathMap[rel];
+      assert.match(cli, /^[0-9a-f]{64}$/);
+      assert.equal(await hostingFileHash(path.join(pub, rel)), cli, `${rel} from file`);
+      assert.equal(await hostingFileHash(await readFile(path.join(pub, rel))), cli, `${rel} from bytes`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

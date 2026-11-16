@@ -164,7 +164,7 @@ test('shell baseline: one hosting:blitz deploy from the frozen release, exact ro
   const { result, firebase, npm, curl } = run;
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.equal(deployCount(firebase), 1);
-  assert.match(firebase, /^deploy --config \S+\/blitz-release-[^/\s]+\/firebase\.json --only hosting:blitz --project master-intelligence-5496f --non-interactive$/m);
+  assert.match(firebase, /^deploy --config \S+\/blitz-release-[^/\s]+\/firebase\.json --only hosting:blitz --project master-intelligence-5496f --non-interactive --json$/m);
   assert.doesNotMatch(firebase, /hosting:clone|hosting:disable|firestore|functions|storage/);
   assert.deepEqual(run.deployedFiles, SECURE_SHELL_FILES);
   assert.match(result.stdout, /^STEP_C_BASELINE=shell$/m);

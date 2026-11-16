@@ -19,14 +19,16 @@ Before anything is deployed:
 - The frozen release still matches its manifest.
 - A second read of the live channel immediately before deploying. Any change stops the run.
 
-The deploy is one `firebase deploy --config <release root>/firebase.json --only hosting:blitz --project master-intelligence-5496f --non-interactive`. That config is the approved `firebase.secure-blitz.json` with `public` pointed at the frozen copy.
+The deploy is one `firebase deploy --config <release root>/firebase.json --only hosting:blitz --project master-intelligence-5496f --non-interactive --json`; `--json` makes the CLI report the one version it created (`STEP_C_DEPLOYED_VERSION`). That config is the approved `firebase.secure-blitz.json` with `public` pointed at the frozen copy.
 
 After the deploy:
 
 - The release changed, `/` returns 200, `/data.enc.json` returns 404, and billing is `False`.
 - The frozen release still matches its manifest (nothing changed it during the upload).
-- The new Hosting version lists exactly the manifest's files.
+- R1: the live channel serves exactly the version the CLI reported, not just some version with the same file names.
+- R1: that version lists exactly the manifest's files **and** each file's Hosting content hash equals the frozen file's. The Hosting API does not report SHA-256 of the bytes: firebase-tools 14.22.0 names each file by SHA-256 of its gzip stream at level 9, so the verifier recomputes that from the frozen copy (proven equal to the CLI's own `Uploader` in `tests/secure-release.test.mjs`). The verifier must run under the same Node/zlib as the CLI; a different zlib fails closed (stop and rollback), never open.
 - Every manifest file and `/` is **byte-identical** to the manifest and passes the same status, redirect, header, CSP and script checks as the baseline.
+- R1: the live channel is read once more after every check; if it changed while being verified, the run stops.
 
 Any failure after the deploy prints `STEP_C_ROLLBACK_COMMAND` and stops. It never retries.
 

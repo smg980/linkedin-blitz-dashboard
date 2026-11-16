@@ -12,7 +12,9 @@
 // The manifest's own SHA-256 is printed once and held by the wrapper; every
 // later check is bound to it.
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { createReadStream, readFileSync } from 'node:fs';
+import { Readable } from 'node:stream';
+import zlib from 'node:zlib';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -200,10 +202,55 @@ export async function verifyFrozen(root, manifestSha256, { repoRoot = ROOT } = {
   return manifest;
 }
 
+// R1: the Hosting API does not report the SHA-256 of a file's bytes. The
+// Firebase CLI (firebase-tools 14.22.0, lib/deploy/hosting/uploader.js:
+// zipStream + hashHandler) uploads, and names, every file by the SHA-256 of
+// its gzip stream at level 9 (zlib.createGzip({ level: 9 }) over a read
+// stream). This is that representation, computed the same way. Run it under
+// the same Node/zlib as the CLI: a different zlib can compress differently,
+// which fails closed (a mismatch stops the run) rather than open.
+export const HOSTING_GZIP_LEVEL = 9;
+
+export async function hostingFileHash(source) {
+  const input = Buffer.isBuffer(source) ? Readable.from([source]) : createReadStream(source);
+  const chunks = [];
+  for await (const chunk of input.pipe(zlib.createGzip({ level: HOSTING_GZIP_LEVEL }))) chunks.push(chunk);
+  return sha256(Buffer.concat(chunks));
+}
+
+// The Hosting hash of every frozen file, keyed by manifest path, after the
+// frozen copy has been re-verified against its manifest.
+export async function expectedHostingHashes(root, manifestSha256, { repoRoot = ROOT } = {}) {
+  const manifest = await verifyFrozen(root, manifestSha256, { repoRoot });
+  const hashes = new Map();
+  for (const file of manifest.files) hashes.set(file.path, await hostingFileHash(path.join(root, RELEASE_PUBLIC, file.path)));
+  // Re-verify: the bytes hashed above are still the manifest's bytes.
+  await verifyFrozen(root, manifestSha256, { repoRoot });
+  return { manifest, hashes };
+}
+
+// R1: `firebase deploy --json` reports the version it created and released
+// (lib/deploy/index.js: { hosting: <version name> } for one deploy). Exactly
+// one version, on this site, or the run stops.
+export function parseDeployVersion(text, site) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error('firebase deploy --json output was not JSON');
+  }
+  const version = data?.result?.hosting;
+  if (data?.status !== 'success' || typeof version !== 'string') throw new Error('firebase deploy did not report exactly one Hosting version');
+  const match = version.match(/^sites\/([a-z0-9-]{1,63})\/versions\/([A-Za-z0-9_-]{1,128})$/);
+  if (!match || match[1] !== site) throw new Error('firebase deploy reported a version on another site');
+  return version;
+}
+
 // GET sites/{site}/versions/{id}/files. One page is all a shell release can have;
 // a continuation token, a duplicate, an unfinished upload or any path outside
-// the expected list fails.
-export function assertVersionFiles(text, expectedPaths) {
+// the expected list fails. With expectedHashes (path -> Hosting hash) every
+// file's content hash must match too (R1).
+export function assertVersionFiles(text, expectedPaths, expectedHashes = null) {
   let data;
   try {
     data = JSON.parse(text);
@@ -229,6 +276,12 @@ export function assertVersionFiles(text, expectedPaths) {
   const missing = wanted.filter((p) => !actual.includes(p));
   if (extra.length) throw new Error(`Hosting version serves files outside the approved list: ${extra.join(', ')}`);
   if (missing.length) throw new Error(`Hosting version is missing approved files: ${missing.join(', ')}`);
+  if (expectedHashes) {
+    for (const file of data.files) {
+      const rel = file.path.slice(1);
+      if (expectedHashes.get(rel) !== file.hash) throw new Error(`Hosting version content differs from the approved release: ${rel}`);
+    }
+  }
   return actual;
 }
 
@@ -360,9 +413,12 @@ async function main(argv) {
     const manifest = await verifyFrozen(rest[0], rest[1]);
     for (const file of manifest.files) console.log(file.path);
   } else if (mode === '--version-files') {
-    const manifest = await verifyFrozen(rest[0], rest[1]);
-    assertVersionFiles(readFileSync(0, 'utf8'), manifest.files.map((file) => file.path));
-    console.log('PASS: live version serves exactly the frozen file list');
+    // R1: paths and every content hash, in the CLI's gzip representation.
+    const { manifest, hashes } = await expectedHostingHashes(rest[0], rest[1]);
+    assertVersionFiles(readFileSync(0, 'utf8'), manifest.files.map((file) => file.path), hashes);
+    console.log('PASS: live version serves exactly the frozen files, byte for byte');
+  } else if (mode === '--deploy-version') {
+    process.stdout.write(`${parseDeployVersion(readFileSync(0, 'utf8'), rest[0])}\n`);
   } else if (mode === '--version-files-demo') {
     // The rollback target for the demo baseline must be exactly the fictional demo build.
     assertVersionFiles(readFileSync(0, 'utf8'), DEMO_HOSTING_FILES);
@@ -382,7 +438,7 @@ async function main(argv) {
   } else if (mode === '--remove') {
     await removeRelease(rest[0]);
   } else {
-    throw new Error('Use --freeze, --verify-frozen, --paths, --shell-paths, --version-files, --version-files-demo, --version-files-shell, --verify-live, --verify-baseline-shell or --remove');
+    throw new Error('Use --freeze, --verify-frozen, --paths, --shell-paths, --version-files, --deploy-version, --version-files-demo, --version-files-shell, --verify-live, --verify-baseline-shell or --remove');
   }
 }
 

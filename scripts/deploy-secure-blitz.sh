@@ -23,6 +23,10 @@
 # firebase deploy reads only that root. The manifest digest printed as
 # STEP_C_RELEASE_MANIFEST_SHA256 binds the pre-deploy re-check, the post-deploy
 # re-check, the live version's file list and every live byte.
+# R1: `firebase deploy --json` reports the version it created; the live channel
+# must serve exactly that version, its Hosting content hashes (SHA-256 of the
+# CLI's level-9 gzip) must equal the frozen files', and the channel is re-read
+# after all checks so drift during verification stops the run.
 # F3: after the deploy every file must answer 200 with no redirect and with the
 # exact approved CSP and security headers; the page must carry the exact CSP and
 # load only config.js and shell.js. The rollback version must list exactly the
@@ -307,25 +311,39 @@ echo "STEP_C_LIVE_VERSION=${previous_version}"
 echo "STEP_C_ROLLBACK_COMMAND=${rollback_command}"
 echo "STEP_C: deploying one secure SHELL-ONLY release to hosting:${TARGET} in ${PROJECT}"
 deploy_started=1
-firebase deploy --config "${release_root}/firebase.json" --only "hosting:$TARGET" --project "$PROJECT" --non-interactive
+# R1: --json makes the CLI report the one version it created and released.
+deploy_json="$(firebase deploy --config "${release_root}/firebase.json" --only "hosting:$TARGET" --project "$PROJECT" --non-interactive --json)" \
+  || stop 'The Firebase CLI deploy failed.'
+deployed_version="$(printf '%s' "$deploy_json" | node scripts/secure-release.mjs --deploy-version "$SITE")" \
+  || stop 'The Firebase CLI did not report exactly one version on this site.'
+echo "STEP_C_DEPLOYED_VERSION=${deployed_version}"
 
 capture_live || stop 'Deploy returned but the new live Hosting release could not be read back.'
+post_deploy="$captured"
 [[ "$captured" != "$previous" ]] || stop 'Hosting release did not change after deployment.'
 new_release="$(printf '%s\n' "$captured" | sed -n '1p')"
 new_version="$(printf '%s\n' "$captured" | sed -n '2p')"
 new_version_id="$(printf '%s\n' "$captured" | sed -n '3p')"
 validate_release_fields "$new_release" "$new_version" "$new_version_id" || stop 'Post-deploy release was not an exact dedicated-site release.'
 [[ "$new_version_id" != "$previous_version_id" ]] || stop 'Hosting version did not change after deployment.'
+# R1: the live channel must serve the version this run uploaded, not merely
+# a version with the same file names (another deploy could have landed).
+[[ "$new_version" == "$deployed_version" ]] || stop 'The live channel does not serve the version this deploy uploaded.'
 shell_code="$(http_code "https://${SITE}.web.app/")" || stop 'Could not read the private shell HTTP status.'
 [[ "$shell_code" == '200' ]] || stop "Private shell did not return HTTP 200 (got ${shell_code})."
 cipher_code="$(http_code "https://${SITE}.web.app/data.enc.json")" || stop 'Could not read the ciphertext path HTTP status.'
 [[ "$cipher_code" == '404' ]] || stop "Public ciphertext path returned HTTP ${cipher_code}; immediate operator review required."
 node scripts/secure-release.mjs --verify-frozen "$release_root" "$manifest_sha" || stop 'Frozen release changed during deploy.'
 write_token
+# R1: every file's content hash in the uploaded version (the CLI's gzip
+# representation) must equal the frozen manifest's file, not just its path.
 version_files "$new_version_id" | node scripts/secure-release.mjs --version-files "$release_root" "$manifest_sha" \
-  || stop 'Live version file list is not exactly the frozen manifest.'
+  || stop 'Live version files or content hashes are not exactly the frozen manifest.'
 verify_live_release || stop 'Live files, status codes or security headers do not match the frozen release.'
 require_billing_off 'Billing state changed.'
+# R1: nothing may have replaced the verified release while it was checked.
+capture_live || stop 'Could not re-read the live Hosting release after verification.'
+[[ "$captured" == "$post_deploy" ]] || stop 'The live Hosting channel changed after verification.'
 deploy_verified=1
 echo "STEP_C_DEPLOY_VERIFIED: new release ${new_release}; manifest ${manifest_sha}; exact files, headers and CSP; public ciphertext 404; billing OFF."
 echo "STEP_C_NEW_RELEASE=${new_release}"

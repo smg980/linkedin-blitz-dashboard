@@ -24,6 +24,12 @@
 //   cipher-live           shell baseline, but /data.enc.json is still served
 //   wrong-release         the operator-supplied release is not the live one
 //   demo-baseline-shell-live  demo baseline requested while a shell is live
+//   live-not-deployed     R1: after the deploy the channel serves another version
+//                         with the same files (a concurrent deploy), not ours
+//   version-hash-stale    R1: the new version lists the right paths but one file's
+//                         content hash is not the frozen file's
+//   drift-after-verify    R1: the channel changes once the release has been checked
+// Version file hashes are the CLI's representation: SHA-256 of gzip level 9.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
@@ -39,6 +45,8 @@ export const releaseBefore = `sites/${site}/channels/live/releases/1794426642121
 export const releaseAfter = `sites/${site}/channels/live/releases/1794999999999000`;
 export const versionBefore = 'beforeversion01';
 export const versionAfter = 'afterversion002';
+export const releaseOther = `sites/${site}/channels/live/releases/1794999999999555`;
+export const versionOther = 'otherversion03';
 export const FICTIONAL_EXPORT = '{"contacts":[{"contact":"Example Plaintext Export","account":"EXAMPLE Leak Co"}]}\n';
 
 export function webConfig(apiKey = 'AIzaSyDUMMYPUBLICWEBCONFIGKEY000000000') {
@@ -113,6 +121,7 @@ copy(pub, out);
 fs.writeFileSync(path.join(env.STUB_STATE, 'deployed-config'), configFile);
 fs.appendFileSync(env.STUB_FIREBASE_LOG, 'DEPLOY\\n');
 fs.writeFileSync(path.join(env.STUB_STATE, 'deployed'), '', { flag: 'a' });
+if (args.includes('--json')) process.stdout.write(JSON.stringify({ status: 'success', result: { hosting: 'sites/${site}/versions/${versionAfter}' } }, null, 2) + '\\n');
 `;
 
 const GCLOUD_STUB = `
@@ -209,13 +218,31 @@ function list(dir, rel) {
 }
 const SHELL = JSON.parse(env.STUB_SHELL_FILES);
 const DEMO = JSON.parse(env.STUB_DEMO_FILES);
-function versionEntry(p) { return { path: '/' + p, hash: crypto.createHash('sha256').update(p).digest('hex'), status: 'ACTIVE' }; }
+const zlib = require('node:zlib');
+// The Hosting API's hash: SHA-256 of the CLI's gzip (level 9) of the file.
+function hostingHash(buf) { return crypto.createHash('sha256').update(zlib.gzipSync(buf, { level: 9 })).digest('hex'); }
+function versionEntry(p, dir, tweak) {
+  const file = dir ? path.join(dir, p) : null;
+  let buf = file && fs.existsSync(file) ? fs.readFileSync(file) : Buffer.from('missing:' + p);
+  if (tweak && tweak(p)) buf = Buffer.concat([buf, Buffer.from('\\n// stale upload\\n')]);
+  return { path: '/' + p, hash: hostingHash(buf), status: 'ACTIVE' };
+}
+let postReads = 0;
+if (deployed && url === api + '/channels/live') {
+  const counter = path.join(env.STUB_STATE, 'post-deploy-channel-reads');
+  postReads = (fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0) + 1;
+  fs.writeFileSync(counter, String(postReads));
+}
 if (url === api + '/channels/live') {
   if (!authed()) status = 401;
   else {
     status = 200;
-    const release = deployed ? '${releaseAfter}' : '${releaseBefore}';
-    const version = deployed ? '${versionAfter}' : '${versionBefore}';
+    let release = deployed ? '${releaseAfter}' : '${releaseBefore}';
+    let version = deployed ? '${versionAfter}' : '${versionBefore}';
+    if (deployed && (mode === 'live-not-deployed' || (mode === 'drift-after-verify' && postReads >= 2))) {
+      release = '${releaseOther}';
+      version = '${versionOther}';
+    }
     body = Buffer.from(JSON.stringify({ name: 'sites/' + SITE + '/channels/live', url: origin, release: { name: release, type: 'DEPLOY', version: { name: 'sites/' + SITE + '/versions/' + version, status: 'FINALIZED' } } }));
   }
 } else if (url === api + '/versions/${versionBefore}/files') {
@@ -224,15 +251,18 @@ if (url === api + '/channels/live') {
     status = 200;
     const names = [...(baseline === 'shell' ? SHELL : DEMO)];
     if (mode === 'rollback-extra') names.push('campaign-export.json');
-    body = Buffer.from(JSON.stringify({ files: names.map(versionEntry) }));
+    const dir = baseline === 'shell' ? env.STUB_PRE_DIR : env.STUB_DEMO_DIR;
+    body = Buffer.from(JSON.stringify({ files: names.map((n) => versionEntry(n, dir)) }));
   }
-} else if (url === api + '/versions/${versionAfter}/files') {
+} else if (url === api + '/versions/${versionAfter}/files' || url === api + '/versions/${versionOther}/files') {
   if (!authed() || !deployed) status = 401;
   else {
     status = 200;
-    const names = list(path.join(env.STUB_STATE, 'live-files'), '');
+    const live = path.join(env.STUB_STATE, 'live-files');
+    const names = list(live, '');
     if (mode === 'version-extra') names.push('campaign-export.json');
-    body = Buffer.from(JSON.stringify({ files: names.map(versionEntry) }));
+    const stale = mode === 'version-hash-stale' ? (n) => n === 'shell.js' : null;
+    body = Buffer.from(JSON.stringify({ files: names.map((n) => versionEntry(n, live, stale)) }));
   }
 } else if (url && url.startsWith(origin + '/')) {
   const name = url === origin + '/' ? 'index.html' : decodeURIComponent(url.slice(origin.length + 1));

@@ -2,7 +2,7 @@
 // Fictional data only. See tests/helpers/hosting-stubs.mjs for each mode.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { deployCount, project, runDeploy, site, versionBefore } from './helpers/hosting-stubs.mjs';
+import { deployCount, project, runDeploy, site, versionAfter, versionBefore } from './helpers/hosting-stubs.mjs';
 import { SECURE_SHELL_FILES } from '../scripts/verify-secure-shell.mjs';
 
 const ROLLBACK = new RegExp(`STEP_C_ROLLBACK_COMMAND=firebase hosting:clone --project ${project} --non-interactive ${site}@${versionBefore} ${site}:live`);
@@ -38,7 +38,7 @@ test('F2: the deploy reads only a frozen private release and serves exactly its 
   const run = await runDeploy({ mode: 'ok' });
   assert.equal(run.result.status, 0, combined(run));
   assert.equal(deployCount(run.firebase), 1);
-  assert.match(run.firebase, /^deploy --config \S+\/blitz-release-[^/\s]+\/firebase\.json --only hosting:blitz --project master-intelligence-5496f --non-interactive$/m);
+  assert.match(run.firebase, /^deploy --config \S+\/blitz-release-[^/\s]+\/firebase\.json --only hosting:blitz --project master-intelligence-5496f --non-interactive --json$/m);
   assert.ok(run.deployedConfig.includes('/blitz-release-') && !run.deployedConfig.startsWith(run.repo));
   assert.deepEqual(run.deployedFiles, SECURE_SHELL_FILES);
   assert.match(run.result.stdout, /^STEP_C_RELEASE_MANIFEST_SHA256=[0-9a-f]{64}$/m);
@@ -66,7 +66,7 @@ test('F2: a file added while the CLI uploads fails verification and prints the e
 
 test('F2: a live version listing any file outside the manifest fails', { timeout: 300000 }, async () => {
   const run = await runDeploy({ mode: 'version-extra' });
-  assertStoppedAfterDeploy(run, /Live version file list is not exactly the frozen manifest/);
+  assertStoppedAfterDeploy(run, /Live version files or content hashes are not exactly the frozen manifest/);
 });
 
 test('F3: a rollback target with anything beyond the fictional demo files is refused before deploy', { timeout: 300000 }, async () => {
@@ -87,5 +87,25 @@ for (const [mode, label] of [
   test(`F3: ${label} after deploy fails and prints the exact rollback`, { timeout: 300000 }, async () => {
     const run = await runDeploy({ mode });
     assertStoppedAfterDeploy(run, /do not match the frozen release/);
+  });
+}
+
+// R1: the uploaded version, its content hashes and the channel after
+// verification are all bound to the frozen release.
+test('R1: the deploy binds the version the CLI reported and prints it', { timeout: 300000 }, async () => {
+  const run = await runDeploy({ mode: 'ok' });
+  assert.equal(run.result.status, 0, combined(run));
+  assert.match(run.result.stdout, new RegExp(`^STEP_C_DEPLOYED_VERSION=sites/${site}/versions/${versionAfter}$`, 'm'));
+  assertNoLeftovers(run);
+});
+
+for (const [mode, label, pattern] of [
+  ['live-not-deployed', 'another version with the same files is live after the deploy', /does not serve the version this deploy uploaded/],
+  ['version-hash-stale', 'the uploaded version holds different content under the right names', /content hashes are not exactly the frozen manifest/],
+  ['drift-after-verify', 'the live channel changes after the release was verified', /channel changed after verification/],
+]) {
+  test(`R1: refuses when ${label}`, { timeout: 300000 }, async () => {
+    const run = await runDeploy({ mode });
+    assertStoppedAfterDeploy(run, pattern);
   });
 }
