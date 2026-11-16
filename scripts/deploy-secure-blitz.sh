@@ -9,6 +9,16 @@
 # BLITZ_EXPECTED_DEMO_RELEASE must be that release.name, copied from a separate
 # read-only GET of the same channel. It is not a short id and not a version id.
 #
+# F2: the reviewed build is frozen once into a private release root outside the
+# repository (scripts/secure-release.mjs) with a SHA-256 manifest of every file.
+# firebase deploy reads only that root. The manifest digest printed as
+# STEP_C_RELEASE_MANIFEST_SHA256 binds the pre-deploy re-check, the post-deploy
+# re-check, the live version's file list and every live byte.
+# F3: after the deploy every file must answer 200 with no redirect and with the
+# exact approved CSP and security headers; the page must carry the exact CSP and
+# load only config.js and shell.js. The rollback version must be exactly the
+# fictional demo file list.
+#
 # This script never runs a rollback. If the deploy starts and verification does
 # not pass, it prints STEP_C_ROLLBACK_COMMAND. That command re-releases only the
 # captured version on this site's live channel. It is not hosting:disable, and
@@ -31,6 +41,10 @@ previous_release=""
 previous_version=""
 previous_version_id=""
 captured=""
+release_root=""
+manifest_sha=""
+fetch_dir=""
+fetch_dirs=()
 
 stop() { echo "STOP: $*" >&2; exit 1; }
 require_suite_attestation() {
@@ -61,6 +75,9 @@ cleanup() {
     echo "Do not retry the deploy and do not deploy any other target." >&2
     echo "STEP_C_ROLLBACK_COMMAND=${rollback_command}" >&2
   fi
+  local fetched
+  for fetched in ${fetch_dirs[@]+"${fetch_dirs[@]}"}; do rm -rf "$fetched"; done
+  if [[ -n "$release_root" ]]; then node scripts/secure-release.mjs --remove "$release_root" || rm -rf "$release_root"; fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -110,6 +127,13 @@ node scripts/secure-hosting-guard.mjs --assert-shell || stop 'Secure shell outpu
 [[ "$(git rev-parse HEAD)" == "$BLITZ_APPROVED_COMMIT" ]] || stop 'Checkout drift after tests.'
 node scripts/secure-hosting-guard.mjs --assert-config || stop 'Private Hosting config check failed.'
 node scripts/secure-hosting-guard.mjs --assert-shell || stop 'Secure shell output check failed.'
+# F2: freeze the checked build once. Nothing below reads .firebase-blitz-private-shell.
+frozen="$(node scripts/secure-release.mjs --freeze .firebase-blitz-private-shell)" || stop 'Could not freeze the reviewed build.'
+release_root="$(printf '%s\n' "$frozen" | sed -n '1p')"
+manifest_sha="$(printf '%s\n' "$frozen" | sed -n '2p')"
+[[ -n "$release_root" && -d "$release_root" && "$manifest_sha" =~ ^[0-9a-f]{64}$ ]] || stop 'Could not freeze the reviewed build.'
+node scripts/secure-release.mjs --verify-frozen "$release_root" "$manifest_sha" || stop 'Frozen release does not match its manifest.'
+echo "STEP_C_RELEASE_MANIFEST_SHA256=${manifest_sha}"
 
 write_token() {
   if [[ -z "$token_file" ]]; then
@@ -156,6 +180,42 @@ verify_demo_sha() {
   [[ "$demo_sha" == "$DEMO_SHA" ]] || stop 'Live Hosting content is not the approved fictional demo.'
 }
 
+# Sets fetch_dir in this shell (not a subshell) so cleanup sees every directory.
+new_fetch_dir() {
+  fetch_dir="$(mktemp -d)" || return 1
+  fetch_dirs+=("$fetch_dir")
+  chmod 700 "$fetch_dir" || return 1
+}
+
+version_files() {
+  # The default page holds far more files than a shell release; a continuation
+  # token is refused by the checker rather than followed.
+  curl --fail --silent --show-error --max-time 20 --retry 0 \
+    -H @"$token_file" \
+    "https://firebasehosting.googleapis.com/v1beta1/sites/${SITE}/versions/$1/files"
+}
+
+fetch_with_headers() {
+  # Records status and headers. A redirect is captured and refused, never followed.
+  curl --silent --show-error --max-time 20 --retry 0 \
+    -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+    -D "$2.headers" -o "$2.body" "$1"
+}
+
+verify_live_release() {
+  local dir paths rel index=0
+  new_fetch_dir || return 1
+  dir="$fetch_dir"
+  paths="$(node scripts/secure-release.mjs --paths "$release_root" "$manifest_sha")" || return 1
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    fetch_with_headers "https://${SITE}.web.app/${rel}" "${dir}/${index}" || return 1
+    index=$((index + 1))
+  done <<< "$paths"
+  fetch_with_headers "https://${SITE}.web.app/" "${dir}/root" || return 1
+  node scripts/secure-release.mjs --verify-live "$release_root" "$manifest_sha" "$dir"
+}
+
 http_code() {
   curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 20 --retry 0 \
     -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$1"
@@ -173,6 +233,11 @@ require_billing_off 'Billing changed before deploy.' || stop 'Billing changed be
 capture_live || stop 'Could not re-read the live Hosting release.'
 [[ "$captured" == "$previous" ]] || stop 'Concurrent Hosting change detected.'
 require_suite_attestation || stop 'Secure suite attestation is missing or does not match this run.'
+# F3: the rollback target must serve exactly the fictional demo files and nothing else.
+write_token
+version_files "$previous_version_id" | node scripts/secure-release.mjs --version-files-demo \
+  || stop 'Rollback version is not exactly the fictional demo; it is not a trustworthy baseline.'
+node scripts/secure-release.mjs --verify-frozen "$release_root" "$manifest_sha" || stop 'Frozen release changed before deploy.'
 
 rollback_command="firebase hosting:clone --project ${PROJECT} --non-interactive ${SITE}@${previous_version_id} ${SITE}:live"
 echo "STEP_C_LIVE_RELEASE=${previous_release}"
@@ -180,7 +245,7 @@ echo "STEP_C_LIVE_VERSION=${previous_version}"
 echo "STEP_C_ROLLBACK_COMMAND=${rollback_command}"
 echo "STEP_C: deploying one secure SHELL-ONLY release to hosting:${TARGET} in ${PROJECT}"
 deploy_started=1
-firebase deploy --config firebase.secure-blitz.json --only "hosting:$TARGET" --project "$PROJECT" --non-interactive
+firebase deploy --config "${release_root}/firebase.json" --only "hosting:$TARGET" --project "$PROJECT" --non-interactive
 
 capture_live || stop 'Deploy returned but the new live Hosting release could not be read back.'
 [[ "$captured" != "$previous" ]] || stop 'Hosting release did not change after deployment.'
@@ -193,8 +258,13 @@ shell_code="$(http_code "https://${SITE}.web.app/")" || stop 'Could not read the
 [[ "$shell_code" == '200' ]] || stop "Private shell did not return HTTP 200 (got ${shell_code})."
 cipher_code="$(http_code "https://${SITE}.web.app/data.enc.json")" || stop 'Could not read the ciphertext path HTTP status.'
 [[ "$cipher_code" == '404' ]] || stop "Public ciphertext path returned HTTP ${cipher_code}; immediate operator review required."
+node scripts/secure-release.mjs --verify-frozen "$release_root" "$manifest_sha" || stop 'Frozen release changed during deploy.'
+write_token
+version_files "$new_version_id" | node scripts/secure-release.mjs --version-files "$release_root" "$manifest_sha" \
+  || stop 'Live version file list is not exactly the frozen manifest.'
+verify_live_release || stop 'Live files, status codes or security headers do not match the frozen release.'
 require_billing_off 'Billing state changed.'
 deploy_verified=1
-echo "STEP_C_DEPLOY_VERIFIED: new release ${new_release}; shell HTTP 200; public ciphertext 404; billing OFF."
+echo "STEP_C_DEPLOY_VERIFIED: new release ${new_release}; manifest ${manifest_sha}; exact files, headers and CSP; public ciphertext 404; billing OFF."
 echo "STEP_C_NEW_RELEASE=${new_release}"
 echo "STEP_C_ROLLBACK_COMMAND=${rollback_command}"
