@@ -9,6 +9,15 @@
 # BLITZ_EXPECTED_DEMO_RELEASE must be that release.name, copied from a separate
 # read-only GET of the same channel. It is not a short id and not a version id.
 #
+# BLITZ_RELEASE_BASELINE selects what must be live before the deploy:
+#   demo  (default) the original fictional demo, checked by its data.enc.json hash,
+#         with BLITZ_EXPECTED_DEMO_RELEASE. This was the one-time Step C replacement.
+#   shell an already-live production secure shell (data.enc.json 404, production
+#         config.js, shell markers), with BLITZ_EXPECTED_LIVE_RELEASE. This is the
+#         repeatable update path for later shell releases.
+# Either way, after the deploy every live file must be byte-identical to the
+# frozen release manifest (F2 below).
+#
 # F2: the reviewed build is frozen once into a private release root outside the
 # repository (scripts/secure-release.mjs) with a SHA-256 manifest of every file.
 # firebase deploy reads only that root. The manifest digest printed as
@@ -16,8 +25,10 @@
 # re-check, the live version's file list and every live byte.
 # F3: after the deploy every file must answer 200 with no redirect and with the
 # exact approved CSP and security headers; the page must carry the exact CSP and
-# load only config.js and shell.js. The rollback version must be exactly the
-# fictional demo file list.
+# load only config.js and shell.js. The rollback version must list exactly the
+# fictional demo files (demo baseline) or the secure shell files (shell
+# baseline). A shell baseline must itself pass the same exact header, status,
+# CSP and script checks before anything is deployed over it.
 #
 # This script never runs a rollback. If the deploy starts and verification does
 # not pass, it prints STEP_C_ROLLBACK_COMMAND. That command re-releases only the
@@ -34,6 +45,7 @@ release_url="https://firebasehosting.googleapis.com/v1beta1/sites/${SITE}/channe
 
 main_pid=$BASHPID
 token_file=""
+expected_release=""
 deploy_started=0
 deploy_verified=0
 rollback_command=""
@@ -85,9 +97,22 @@ trap 'exit 130' INT TERM
 [[ -z "${CI:-}" && -z "${GITHUB_ACTIONS:-}" ]] || stop 'Never deploy from CI.'
 [[ "${BLITZ_APPROVE_SECURE_SHELL_DEPLOY:-}" == 'YES' ]] || stop 'Explicit Step C opt-in is required.'
 [[ -z "${DASHBOARD_PASSPHRASE:-}" ]] || stop 'No campaign passphrase may be in the environment.'
+RELEASE_BASELINE="${BLITZ_RELEASE_BASELINE:-demo}"
+case "$RELEASE_BASELINE" in
+  demo)
+    [[ -z "${BLITZ_EXPECTED_LIVE_RELEASE:-}" ]] || stop 'The demo baseline uses BLITZ_EXPECTED_DEMO_RELEASE, not BLITZ_EXPECTED_LIVE_RELEASE.'
+    expected_release="${BLITZ_EXPECTED_DEMO_RELEASE:-}"
+    ;;
+  shell)
+    [[ -z "${BLITZ_EXPECTED_DEMO_RELEASE:-}" ]] || stop 'The shell baseline uses BLITZ_EXPECTED_LIVE_RELEASE, not BLITZ_EXPECTED_DEMO_RELEASE.'
+    expected_release="${BLITZ_EXPECTED_LIVE_RELEASE:-}"
+    ;;
+  *) stop 'BLITZ_RELEASE_BASELINE must be demo or shell.' ;;
+esac
 [[ -n "${BLITZ_APPROVED_COMMIT:-}" ]] || stop 'Pinned reviewed commit is required.'
 [[ "$(git rev-parse HEAD)" == "$BLITZ_APPROVED_COMMIT" ]] || stop 'Checkout is not the approved commit.'
 [[ -z "$(git status --porcelain)" ]] || stop 'Dirty checkout; preserve uncommitted work.'
+[[ -n "$expected_release" ]] || stop 'The exact expected live release name is required.'
 command -v firebase >/dev/null || stop 'Authorized Firebase CLI missing.'
 command -v gcloud >/dev/null || stop 'Authorized gcloud missing.'
 command -v curl >/dev/null || stop 'curl missing.'
@@ -106,10 +131,14 @@ fi
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
+    -u BLITZ_EXPECTED_LIVE_RELEASE \
+    -u BLITZ_RELEASE_BASELINE \
     npm test || stop 'npm test failed.'
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
+    -u BLITZ_EXPECTED_LIVE_RELEASE \
+    -u BLITZ_RELEASE_BASELINE \
     npm run verify:bundle || stop 'verify:bundle failed.'
 BLITZ_SECURE_ATTEST_NONCE="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" || stop 'Cannot create the secure suite attestation.'
 [[ "$BLITZ_SECURE_ATTEST_NONCE" =~ ^[0-9a-f]{32}$ ]] || stop 'Cannot create the secure suite attestation.'
@@ -119,6 +148,8 @@ export BLITZ_SECURE_ATTEST_NONCE BLITZ_SECURE_ATTEST_PATH
 env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \
     -u BLITZ_APPROVED_COMMIT \
     -u BLITZ_EXPECTED_DEMO_RELEASE \
+    -u BLITZ_EXPECTED_LIVE_RELEASE \
+    -u BLITZ_RELEASE_BASELINE \
     npm run test:secure || stop 'test:secure failed.'
 require_suite_attestation || stop 'Secure suite attestation is missing or does not match this run.'
 node scripts/build-secure-shell.mjs --config "${BLITZ_SECURE_CONFIG:-secure-config.local.json}" || stop 'Secure shell build failed.'
@@ -202,6 +233,27 @@ fetch_with_headers() {
     -D "$2.headers" -o "$2.body" "$1"
 }
 
+fetch_shell_paths() {
+  # Fetches every secure-shell path and "/" with headers into $1, in allowlist order.
+  local dir="$1" paths rel index=0
+  paths="$(node scripts/secure-release.mjs --shell-paths)" || return 1
+  while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    fetch_with_headers "https://${SITE}.web.app/${rel}" "${dir}/${index}" || return 1
+    index=$((index + 1))
+  done <<< "$paths"
+  fetch_with_headers "https://${SITE}.web.app/" "${dir}/root"
+}
+
+verify_shell_baseline() {
+  local code
+  new_fetch_dir || return 1
+  fetch_shell_paths "$fetch_dir" || return 1
+  node scripts/secure-release.mjs --verify-baseline-shell "$fetch_dir" || return 1
+  code="$(http_code "https://${SITE}.web.app/data.enc.json")" || return 1
+  [[ "$code" == '404' ]] || return 1
+}
+
 verify_live_release() {
   local dir paths rel index=0
   new_fetch_dir || return 1
@@ -227,19 +279,29 @@ previous_release="$(printf '%s\n' "$previous" | sed -n '1p')"
 previous_version="$(printf '%s\n' "$previous" | sed -n '2p')"
 previous_version_id="$(printf '%s\n' "$previous" | sed -n '3p')"
 validate_release_fields "$previous_release" "$previous_version" "$previous_version_id" || stop 'Invalid rollback source.'
-[[ "${BLITZ_EXPECTED_DEMO_RELEASE:-}" == "$previous_release" ]] || stop "Current live release does not equal the explicitly verified fictional-demo release. Captured: ${previous_release}"
-verify_demo_sha || stop 'Cannot verify existing fictional demo.'
+[[ "$expected_release" == "$previous_release" ]] || stop "Current live release does not equal the explicitly verified ${RELEASE_BASELINE} release. Captured: ${previous_release}"
+if [[ "$RELEASE_BASELINE" == 'shell' ]]; then
+  verify_shell_baseline || stop 'Live Hosting content is not a production secure shell with no public ciphertext.'
+else
+  verify_demo_sha || stop 'Cannot verify existing fictional demo.'
+fi
 require_billing_off 'Billing changed before deploy.' || stop 'Billing changed before deploy.'
 capture_live || stop 'Could not re-read the live Hosting release.'
 [[ "$captured" == "$previous" ]] || stop 'Concurrent Hosting change detected.'
 require_suite_attestation || stop 'Secure suite attestation is missing or does not match this run.'
-# F3: the rollback target must serve exactly the fictional demo files and nothing else.
+# F3: the rollback target must serve exactly its baseline's files and nothing else.
 write_token
-version_files "$previous_version_id" | node scripts/secure-release.mjs --version-files-demo \
-  || stop 'Rollback version is not exactly the fictional demo; it is not a trustworthy baseline.'
+if [[ "$RELEASE_BASELINE" == 'shell' ]]; then
+  version_files "$previous_version_id" | node scripts/secure-release.mjs --version-files-shell \
+    || stop 'Rollback version is not exactly a secure shell; it is not a trustworthy baseline.'
+else
+  version_files "$previous_version_id" | node scripts/secure-release.mjs --version-files-demo \
+    || stop 'Rollback version is not exactly the fictional demo; it is not a trustworthy baseline.'
+fi
 node scripts/secure-release.mjs --verify-frozen "$release_root" "$manifest_sha" || stop 'Frozen release changed before deploy.'
 
 rollback_command="firebase hosting:clone --project ${PROJECT} --non-interactive ${SITE}@${previous_version_id} ${SITE}:live"
+echo "STEP_C_BASELINE=${RELEASE_BASELINE}"
 echo "STEP_C_LIVE_RELEASE=${previous_release}"
 echo "STEP_C_LIVE_VERSION=${previous_version}"
 echo "STEP_C_ROLLBACK_COMMAND=${rollback_command}"

@@ -203,7 +203,7 @@ test('secure deploy script can target only hosting:blitz and prints an exact clo
   assert.match(scriptCode, /-H @"\$token_file"/);
   assert.match(scriptCode, /Concurrent Hosting change detected/);
   assert.match(scriptCode, /deploy_verified=1/);
-  const isolated = 'env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \\\n    -u BLITZ_APPROVED_COMMIT \\\n    -u BLITZ_EXPECTED_DEMO_RELEASE \\\n    ';
+  const isolated = 'env -u BLITZ_APPROVE_SECURE_SHELL_DEPLOY \\\n    -u BLITZ_APPROVED_COMMIT \\\n    -u BLITZ_EXPECTED_DEMO_RELEASE \\\n    -u BLITZ_EXPECTED_LIVE_RELEASE \\\n    -u BLITZ_RELEASE_BASELINE \\\n    ';
   for (const [command, message] of [
     ['npm test', 'npm test failed.'],
     ['npm run verify:bundle', 'verify:bundle failed.'],
@@ -405,7 +405,7 @@ cat "$SECURE_GATE_SITES"
   await writeExecutable(path.join(bin, 'npm'), `#!/bin/sh
 set -u
 printf '%s\\n' "$*" >> "$SECURE_GATE_NPM_LOG"
-if [ -n "\${BLITZ_APPROVE_SECURE_SHELL_DEPLOY:-}" ] || [ -n "\${BLITZ_APPROVED_COMMIT:-}" ] || [ -n "\${BLITZ_EXPECTED_DEMO_RELEASE:-}" ]; then
+if [ -n "\${BLITZ_APPROVE_SECURE_SHELL_DEPLOY:-}" ] || [ -n "\${BLITZ_APPROVED_COMMIT:-}" ] || [ -n "\${BLITZ_EXPECTED_DEMO_RELEASE:-}" ] || [ -n "\${BLITZ_EXPECTED_LIVE_RELEASE:-}" ] || [ -n "\${BLITZ_RELEASE_BASELINE:-}" ]; then
   printf '%s\\n' APPROVAL_VARS_PRESENT >> "$SECURE_GATE_NPM_LOG"
 fi
 if [ "$1" = "run" ] && [ "$2" = "test:secure" ]; then

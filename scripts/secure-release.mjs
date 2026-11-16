@@ -328,6 +328,26 @@ export async function verifyLive({ root, manifestSha256, fetchDir, repoRoot = RO
   return manifest;
 }
 
+// A live shell whose bytes we cannot compare (the rollback baseline of an
+// update): every allowlisted path must answer 200 with the exact approved
+// headers, "/" must equal /index.html, the page must be the strict shell, and
+// config.js must be the production web config.
+export async function verifyBaselineShell({ fetchDir, repoRoot = ROOT }) {
+  const approved = approvedHeaders(JSON.parse(await fs.readFile(path.join(repoRoot, 'firebase.secure-blitz.json'), 'utf8')));
+  for (const [index, rel] of SECURE_SHELL_FILES.entries()) {
+    assertResponseHeaders(await fs.readFile(path.join(fetchDir, `${index}.headers`), 'utf8'), rel, approved);
+  }
+  assertResponseHeaders(await fs.readFile(path.join(fetchDir, 'root.headers'), 'utf8'), '/', approved);
+  const html = await fs.readFile(path.join(fetchDir, 'root.body'), 'utf8');
+  const indexHtml = await fs.readFile(path.join(fetchDir, `${SECURE_SHELL_FILES.indexOf('index.html')}.body`), 'utf8');
+  if (html !== indexHtml) throw new Error('Live / and /index.html differ');
+  assertShellHtml(html);
+  assertPrivateWebConfig(await fs.readFile(path.join(fetchDir, `${SECURE_SHELL_FILES.indexOf('config.js')}.body`), 'utf8'));
+  const shell = await fs.readFile(path.join(fetchDir, `${SECURE_SHELL_FILES.indexOf('shell.js')}.body`), 'utf8');
+  if (/data\.enc\.json/.test(shell)) throw new Error('Live shell script references public ciphertext');
+  return true;
+}
+
 async function main(argv) {
   const [mode, ...rest] = argv;
   if (mode === '--freeze') {
@@ -347,13 +367,22 @@ async function main(argv) {
     // The rollback target for the demo baseline must be exactly the fictional demo build.
     assertVersionFiles(readFileSync(0, 'utf8'), DEMO_HOSTING_FILES);
     console.log('PASS: rollback version serves exactly the fictional demo file list');
+  } else if (mode === '--version-files-shell') {
+    // The rollback target for the shell baseline must be exactly a secure shell build.
+    assertVersionFiles(readFileSync(0, 'utf8'), SECURE_SHELL_FILES);
+    console.log('PASS: rollback version serves exactly the secure shell file list');
+  } else if (mode === '--shell-paths') {
+    for (const rel of SECURE_SHELL_FILES) console.log(rel);
+  } else if (mode === '--verify-baseline-shell') {
+    await verifyBaselineShell({ fetchDir: rest[0] });
+    console.log('PASS: live baseline is an exact production secure shell');
   } else if (mode === '--verify-live') {
     await verifyLive({ root: rest[0], manifestSha256: rest[1], fetchDir: rest[2] });
     console.log('PASS: live files, status codes and security headers match the frozen release');
   } else if (mode === '--remove') {
     await removeRelease(rest[0]);
   } else {
-    throw new Error('Use --freeze, --verify-frozen, --paths, --version-files, --version-files-demo, --verify-live or --remove');
+    throw new Error('Use --freeze, --verify-frozen, --paths, --shell-paths, --version-files, --version-files-demo, --version-files-shell, --verify-live, --verify-baseline-shell or --remove');
   }
 }
 
