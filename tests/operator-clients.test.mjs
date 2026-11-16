@@ -161,7 +161,7 @@ test('R5: production and emulator Firestore settings disable Commit and channel 
 // R4: cleanup (lock release, client shutdown) runs in `finally`. A cleanup
 // failure must never replace a committed or unknown outcome with a refusal.
 const { acquireOperatorLock } = await import('../secure/operator-lock.mjs');
-const { exitCodeFor, failureLine } = await import('../scripts/blitz-campaign-store.mjs');
+const { completionExitCode, exitCodeFor, failureLine } = await import('../scripts/blitz-campaign-store.mjs');
 const failingRelease = (released) => async (options) => {
   const lock = await acquireOperatorLock(options);
   return {
@@ -186,6 +186,8 @@ test('R4: a cleanup failure after a verified commit keeps the committed outcome'
     assert.ok(outcome.result, `committed run must not surface as ${outcome.error?.code ?? outcome.error}`);
     assert.equal(outcome.result.outcome, 'committed-verified');
     assert.equal(outcome.result.cleanupComplete, false);
+    assert.deepEqual(outcome.result.cleanupFailures, ['LOCK_RELEASE_FAILED']);
+    assert.equal(completionExitCode(outcome), 10, 'never the success exit');
   } finally {
     await h.close();
   }
@@ -203,7 +205,8 @@ test('R4: a cleanup failure after an unresolved commit keeps STORE_OUTCOME_UNKNO
     assert.ok(error instanceof StoreRefusal, `got ${error}`);
     assert.equal(error.code, 'STORE_OUTCOME_UNKNOWN');
     assert.equal(exitCodeFor(error), 3);
-    assert.match(failureLine(error), /^STORE_UNRESOLVED STORE_OUTCOME_UNKNOWN CLEANUP_INCOMPLETE$/);
+    assert.equal(completionExitCode({ error }), 13);
+    assert.match(failureLine(error), /^STORE_UNRESOLVED STORE_OUTCOME_UNKNOWN CLEANUP_INCOMPLETE LOCK_RELEASE_FAILED$/);
   } finally {
     await h.close();
   }
@@ -219,11 +222,156 @@ test('R4: a cleanup failure after a refusal stays a refusal and leaks nothing', 
     assert.equal(released.length, 1);
     assert.equal(error.code, 'STORE_APPROVAL_REQUIRED');
     assert.equal(exitCodeFor(error), 1);
+    assert.equal(completionExitCode({ error }), 11);
     assert.doesNotMatch(failureLine(error), /EIO|private/);
     assert.equal(h.firestore.state.commits.length, 0);
   } finally {
     await h.close();
   }
+});
+
+// R4 (Codex f82bb16): the lock is genuinely retained or unverifiable. These use
+// the real acquireOperatorLock and inject failures into the real filesystem
+// calls release() makes (its in-process `io` seam), so the lock file on disk is
+// really left behind. A leftover lock is conservative, but the run must not
+// signal complete success, and the mutation outcome must be preserved.
+const realFs = fs;
+const ioFault = (fault) => ({
+  lstat: (...a) => (fault.lstat ? fault.lstat(...a) : realFs.lstat(...a)),
+  readFile: (...a) => (fault.readFile ? fault.readFile(...a) : realFs.readFile(...a)),
+  unlink: (...a) => (fault.unlink ? fault.unlink(...a) : realFs.unlink(...a)),
+});
+const eio = (what) => async () => { throw Object.assign(new Error(`EIO: synthetic ${what} /private/path`), { code: 'EIO' }); };
+const lockWithIo = (fault, seen) => async (options) => {
+  const lock = await acquireOperatorLock({ ...options, io: ioFault(fault) });
+  seen.file = lock.file;
+  return lock;
+};
+const lockStillHeld = async (seen) => realFs.lstat(seen.file).then((i) => i.isFile(), () => false);
+
+for (const [label, fault, code] of [
+  ['unlink fails (the lock stays held)', { unlink: eio('unlink') }, 'LOCK_RELEASE_UNLINK_FAILED'],
+  ['the lock cannot be read (EIO)', { readFile: eio('read') }, 'LOCK_RELEASE_UNREADABLE'],
+  ['the lock cannot be stat-ed (EIO)', { lstat: eio('lstat') }, 'LOCK_RELEASE_UNREADABLE'],
+]) {
+  test(`R4: committed-verified when ${label}: outcome kept, exit 10, lock left, fixed code`, { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+    const h = await harness();
+    try {
+      const seen = {};
+      const receipt = path.join(h.work, 'receipt.json');
+      const result = await main(writeArgs(h, receipt), writeEnv(h), { ...h.deps, acquireOperatorLock: lockWithIo(fault, seen) });
+      assert.equal(result.outcome, 'committed-verified');
+      assert.equal(result.cleanupComplete, false);
+      assert.deepEqual(result.cleanupFailures, [code]);
+      assert.equal(completionExitCode({ result }), 10);
+      assert.equal(h.firestore.state.commits.length, 1);
+      assert.equal(JSON.parse(await fs.readFile(receipt, 'utf8')).status, 'COMMITTED_VERIFIED');
+      assert.equal(await lockStillHeld(seen), true, 'the real lock file is still present');
+      assert.doesNotMatch(JSON.stringify(result), /EIO|private/);
+      // The retained lock fails closed for the next run.
+      const again = await main(writeArgs(h, path.join(h.work, 'receipt-2.json')), writeEnv(h), h.deps).catch((e) => e);
+      assert.equal(again.code, 'STORE_OPERATOR_LOCK_HELD');
+      assert.equal(h.firestore.state.commits.length, 1);
+    } finally {
+      await h.close();
+    }
+  });
+}
+
+test('R4: an unknown outcome with an unreadable lock stays STORE_OUTCOME_UNKNOWN (exit 13), receipt OUTCOME_UNKNOWN', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  let grpcStatus;
+  const h = await harness({ commitFault: (attempt, request, apply) => { apply(); return { code: grpcStatus.UNAVAILABLE, details: 'synthetic' }; } });
+  grpcStatus = h.firestore.grpcStatus;
+  try {
+    const seen = {};
+    const receipt = path.join(h.work, 'receipt.json');
+    const error = await main(writeArgs(h, receipt), writeEnv(h), { ...h.deps, acquireOperatorLock: lockWithIo({ readFile: eio('read') }, seen) }).catch((e) => e);
+    assert.ok(error instanceof StoreRefusal);
+    assert.equal(error.code, 'STORE_OUTCOME_UNKNOWN');
+    assert.equal(error.outcome, 'unknown');
+    assert.deepEqual(error.cleanupFailures, ['LOCK_RELEASE_UNREADABLE']);
+    assert.equal(completionExitCode({ error }), 13);
+    assert.equal(failureLine(error), 'STORE_UNRESOLVED STORE_OUTCOME_UNKNOWN CLEANUP_INCOMPLETE LOCK_RELEASE_UNREADABLE');
+    assert.equal(JSON.parse(await fs.readFile(receipt, 'utf8')).status, 'OUTCOME_UNKNOWN');
+    assert.equal(h.firestore.state.commits.length, 1);
+    assert.equal(await lockStillHeld(seen), true);
+  } finally {
+    await h.close();
+  }
+});
+
+test('R4: a pre-write refusal with a failed unlink stays a refusal (exit 11), nothing written', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  const h = await harness();
+  try {
+    const seen = {};
+    const env = { ...writeEnv(h), BLITZ_STORE_APPROVAL: 'WRITE:wrong' };
+    const error = await main(writeArgs(h, path.join(h.work, 'receipt.json')), env, { ...h.deps, acquireOperatorLock: lockWithIo({ unlink: eio('unlink') }, seen) }).catch((e) => e);
+    assert.equal(error.code, 'STORE_APPROVAL_REQUIRED');
+    assert.equal(completionExitCode({ error }), 11);
+    assert.equal(failureLine(error), 'STORE_REFUSED STORE_APPROVAL_REQUIRED CLEANUP_INCOMPLETE LOCK_RELEASE_UNLINK_FAILED');
+    assert.equal(h.firestore.state.commits.length, 0);
+    assert.equal(await lockStillHeld(seen), true);
+  } finally {
+    await h.close();
+  }
+});
+
+for (const [label, tamper, code, held] of [
+  ['removed by someone else', async (file) => realFs.unlink(file), 'LOCK_RELEASE_MISSING', false],
+  ['replaced by another holder', async (file) => { await realFs.unlink(file); await realFs.writeFile(file, '{"nonce":"someone-else"}\n', { mode: 0o600 }); }, 'LOCK_RELEASE_NOT_OWNED', true],
+  ['rewritten in place with another nonce', async (file) => realFs.writeFile(file, '{"nonce":"someone-else"}\n'), 'LOCK_RELEASE_NOT_OWNED', true],
+]) {
+  test(`R4: a lock ${label} during the run is never reported as released`, { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+    const h = await harness();
+    try {
+      const seen = {};
+      const deps = { ...h.deps, acquireOperatorLock: async (options) => {
+        const lock = await acquireOperatorLock(options);
+        seen.file = lock.file;
+        return { file: lock.file, release: async () => { await tamper(lock.file); return lock.release(); } };
+      } };
+      const result = await main(writeArgs(h, path.join(h.work, 'receipt.json')), writeEnv(h), deps);
+      assert.equal(result.outcome, 'committed-verified');
+      assert.deepEqual(result.cleanupFailures, [code]);
+      assert.equal(completionExitCode({ result }), 10);
+      assert.equal(await lockStillHeld(seen), held, 'another holder\'s lock is never removed');
+    } finally {
+      await h.close();
+    }
+  });
+}
+
+test('R4: a clean run exits 0 and leaves no lock', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  const h = await harness();
+  try {
+    const seen = {};
+    const result = await main(writeArgs(h, path.join(h.work, 'receipt.json')), writeEnv(h), { ...h.deps, acquireOperatorLock: lockWithIo({}, seen) });
+    assert.equal(result.outcome, 'committed-verified');
+    assert.equal(result.cleanupComplete, undefined);
+    assert.equal(completionExitCode({ result }), 0);
+    assert.equal(await lockStillHeld(seen), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test('R4: the CLI exits only through completionExitCode, never an unconditional 0', async () => {
+  const source = await fs.readFile(new URL('../scripts/blitz-campaign-store.mjs', import.meta.url), 'utf8');
+  const cli = source.slice(source.lastIndexOf('if (process.argv[1]'));
+  assert.doesNotMatch(cli, /process\.exit\(\s*0\s*\)/);
+  assert.equal([...cli.matchAll(/process\.exit\(completionExitCode\(\{ (result|error) \}\)\)/g)].length, 2);
+  assert.match(cli, /cleanupIncompleteLine\(result\)/);
+});
+
+test('R4: completion exit codes are distinct for every outcome with and without cleanup', () => {
+  const err = (outcome, cleanupComplete) => Object.assign(new StoreRefusal('X'), outcome ? { outcome } : {}, cleanupComplete === false ? { cleanupComplete } : {});
+  const codes = [
+    completionExitCode({ result: {} }), completionExitCode({ result: { cleanupComplete: false } }),
+    ...[undefined, 'unknown', 'committed-eligibility-changed', 'committed-verified'].flatMap((o) => [completionExitCode({ error: err(o) }), completionExitCode({ error: err(o, false) })]),
+  ];
+  assert.deepEqual(codes, [0, 10, 1, 11, 3, 13, 4, 14, 5, 15]);
+  assert.equal(new Set(codes).size, codes.length);
+  assert.equal(completionExitCode({ error: new Error('x') }), 1);
 });
 
 test('R4: runCleanup attempts every step, bounds a hanging one and reports incompleteness', async () => {

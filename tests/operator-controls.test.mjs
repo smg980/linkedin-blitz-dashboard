@@ -158,6 +158,46 @@ test('F4: production runs bind the checked credential before any SDK call and pr
   }
 });
 
+// R4: release() reports every release it cannot confirm with a fixed code and
+// leaves the file; it never substitutes an empty read for an unreadable lock.
+test('R4: operator lock release fails closed with fixed codes and never removes a lock it cannot prove is its own', async () => {
+  const dir = await tempDir('blitz-lock-r4-');
+  const eio = async () => { throw Object.assign(new Error('EIO /private/x'), { code: 'EIO' }); };
+  const io = (fault) => ({ lstat: fault.lstat || fs.lstat, readFile: fault.readFile || fs.readFile, unlink: fault.unlink || fs.unlink });
+  const exists = (file) => fs.lstat(file).then(() => true, () => false);
+  try {
+    for (const [fault, code] of [
+      [{ readFile: eio }, 'LOCK_RELEASE_UNREADABLE'],
+      [{ lstat: eio }, 'LOCK_RELEASE_UNREADABLE'],
+      [{ unlink: eio }, 'LOCK_RELEASE_UNLINK_FAILED'],
+    ]) {
+      const lock = await acquireOperatorLock({ project: 'demo-blitz-store', purpose: 'store-write', dir, io: io(fault) });
+      assert.equal(await refusalCode(lock.release()), code);
+      assert.equal(await exists(lock.file), true, `${code}: the lock is still held`);
+      assert.equal(await refusalCode(acquireOperatorLock({ project: 'demo-blitz-store', purpose: 'x', dir })), 'LOCK_HELD');
+      await fs.unlink(lock.file);
+    }
+    const gone = await acquireOperatorLock({ project: 'demo-blitz-store', purpose: 'store-write', dir });
+    await fs.unlink(gone.file);
+    assert.equal(await refusalCode(gone.release()), 'LOCK_RELEASE_MISSING');
+    const replaced = await acquireOperatorLock({ project: 'demo-blitz-store', purpose: 'store-write', dir });
+    await fs.unlink(replaced.file);
+    await fs.writeFile(replaced.file, '{"nonce":"another-holder"}\n', { mode: 0o600 });
+    assert.equal(await refusalCode(replaced.release()), 'LOCK_RELEASE_NOT_OWNED');
+    assert.equal(await fs.readFile(replaced.file, 'utf8'), '{"nonce":"another-holder"}\n');
+    await fs.unlink(replaced.file);
+    // A failed release can be retried once the cause is gone.
+    let failNext = true;
+    const retry = await acquireOperatorLock({ project: 'demo-blitz-store', purpose: 'store-write', dir,
+      io: io({ unlink: async (f) => { if (failNext) { failNext = false; throw Object.assign(new Error('x'), { code: 'EIO' }); } return fs.unlink(f); } }) });
+    assert.equal(await refusalCode(retry.release()), 'LOCK_RELEASE_UNLINK_FAILED');
+    await retry.release();
+    assert.equal(await exists(retry.file), false);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('operator lock: exclusive per project, private, never broken by another holder', async () => {
   const dir = await tempDir('blitz-lock-');
   try {

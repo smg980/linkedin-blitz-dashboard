@@ -10,6 +10,7 @@
 // outside any checkout). It is never broken automatically: a stale lock is a
 // stop for a human, who confirms no other run is active and removes it.
 import { randomBytes } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -62,7 +63,21 @@ async function privateDirectory(dir) {
   return fs.realpath(dir);
 }
 
-export async function acquireOperatorLock({ project, purpose, dir = lockDirectory() }) {
+// R4: release() either removes exactly the lock this holder created, or throws
+// one of these fixed codes and leaves whatever is there. It never reports a
+// release it could not confirm.
+export const LOCK_RELEASE_CODES = Object.freeze([
+  'LOCK_RELEASE_MISSING', // the lock file is gone: someone else removed it
+  'LOCK_RELEASE_UNREADABLE', // it could not be read (EIO, EACCES, ...)
+  'LOCK_RELEASE_NOT_OWNED', // it is not the file/nonce this holder created
+  'LOCK_RELEASE_UNLINK_FAILED', // ours, but removing it failed
+]);
+
+const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino;
+
+// `io` is the filesystem used by release(); tests inject real-call failures
+// through it. It is an in-process dependency, never reachable from argv/env.
+export async function acquireOperatorLock({ project, purpose, dir = lockDirectory(), io = fs }) {
   if (!PROJECT.test(project || '')) throw new LockRefusal('LOCK_INVALID_PROJECT');
   if (!/^[a-z0-9-]{1,40}$/.test(purpose || '')) throw new LockRefusal('LOCK_INVALID_PURPOSE');
   const real = await privateDirectory(dir);
@@ -75,9 +90,11 @@ export async function acquireOperatorLock({ project, purpose, dir = lockDirector
     if (error?.code === 'EEXIST') throw new LockRefusal('LOCK_HELD');
     throw new LockRefusal('LOCK_UNAVAILABLE');
   }
+  let created;
   try {
     await handle.writeFile(`${JSON.stringify({ purpose, pid: process.pid, startedAt: new Date().toISOString(), nonce })}\n`);
     await handle.sync();
+    created = await handle.stat();
   } finally {
     await handle.close();
   }
@@ -86,10 +103,35 @@ export async function acquireOperatorLock({ project, purpose, dir = lockDirector
     file,
     async release() {
       if (released) return;
+      // Only remove the lock this holder created, and only after proving it:
+      // the same file (dev/ino) before and after reading our nonce from it.
+      let before;
+      try {
+        before = await io.lstat(file);
+      } catch (error) {
+        throw new LockRefusal(error?.code === 'ENOENT' ? 'LOCK_RELEASE_MISSING' : 'LOCK_RELEASE_UNREADABLE');
+      }
+      if (!before.isFile() || !sameFile(before, created)) throw new LockRefusal('LOCK_RELEASE_NOT_OWNED');
+      let text;
+      try {
+        text = await io.readFile(file, { encoding: 'utf8', flag: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW });
+      } catch (error) {
+        throw new LockRefusal(error?.code === 'ENOENT' ? 'LOCK_RELEASE_MISSING' : 'LOCK_RELEASE_UNREADABLE');
+      }
+      if (typeof text !== 'string' || !text.includes(`"nonce":"${nonce}"`)) throw new LockRefusal('LOCK_RELEASE_NOT_OWNED');
+      let after;
+      try {
+        after = await io.lstat(file);
+      } catch (error) {
+        throw new LockRefusal(error?.code === 'ENOENT' ? 'LOCK_RELEASE_MISSING' : 'LOCK_RELEASE_UNREADABLE');
+      }
+      if (!sameFile(after, before)) throw new LockRefusal('LOCK_RELEASE_NOT_OWNED');
+      try {
+        await io.unlink(file);
+      } catch {
+        throw new LockRefusal('LOCK_RELEASE_UNLINK_FAILED');
+      }
       released = true;
-      // Only remove the lock this holder created.
-      const text = await fs.readFile(file, 'utf8').catch(() => '');
-      if (text.includes(`"nonce":"${nonce}"`)) await fs.rm(file, { force: true });
     },
   };
 }

@@ -15,6 +15,9 @@
 // applied, read the receipt and inspect, never re-run the same apply; 4 committed
 // but the owner record changed during the commit; 5 committed and verified but
 // the receipt could not record it. Read the receipt for 3-5.
+// R4: 10 + any of those (10, 11, 13, 14, 15) is the same outcome with cleanup
+// incomplete: the operator lock may still be held (or its release could not be
+// confirmed). The outcome is unchanged; never re-run the apply because of it.
 //
 // F4: production uses only the operator's gcloud user ADC file (checked, then
 // handed to the SDK explicitly) and requires it to belong to the account the
@@ -365,8 +368,10 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
     try {
       await assertOutsideRepository(path.dirname(lock.file), 'STORE_LOCK_INSIDE_REPOSITORY');
     } catch (error) {
-      await runCleanup([() => lock.release()]);
-      throw error;
+      const failures = await runCleanupSteps([['LOCK_RELEASE', () => lock.release()]]);
+      const refusal = error instanceof StoreRefusal ? error : new StoreRefusal('STORE_LOCK_INSIDE_REPOSITORY');
+      if (failures.length) Object.assign(refusal, { cleanupComplete: false, cleanupFailures: failures });
+      throw refusal;
     }
   }
   let app;
@@ -422,41 +427,53 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
     outcome = { error: error instanceof StoreRefusal ? error : new StoreRefusal('STORE_OPERATION_FAILED') };
   }
   // R4: cleanup never decides the outcome. Each step is attempted, bounded and
-  // contained; a failure is reported alongside the outcome, never instead of it.
-  const cleanupComplete = await runCleanup([
-    firestore && (() => firestore.terminate()),
-    app && (() => deleteApp(app)),
-    lock && (() => lock.release()),
+  // contained; a failure is reported alongside the outcome, never instead of it,
+  // and never as complete success (see completionExitCode).
+  const cleanupFailures = await runCleanupSteps([
+    firestore && ['FIRESTORE_TERMINATE', () => firestore.terminate()],
+    app && ['APP_DELETE', () => deleteApp(app)],
+    lock && ['LOCK_RELEASE', () => lock.release()],
   ]);
   if (outcome.error) {
-    if (!cleanupComplete) outcome.error.cleanupComplete = false;
+    if (cleanupFailures.length) Object.assign(outcome.error, { cleanupComplete: false, cleanupFailures });
     throw outcome.error;
   }
-  return cleanupComplete ? outcome.result : { ...outcome.result, cleanupComplete: false };
+  return cleanupFailures.length ? { ...outcome.result, cleanupComplete: false, cleanupFailures } : outcome.result;
 }
 
 const CLEANUP_STEP_MS = 3000;
+// Fixed codes only: errors can carry paths or SDK text and are never printed.
+const LOCK_FAILURE = /^LOCK_RELEASE_[A-Z_]+$/;
 
-// Runs every step even if an earlier one fails or hangs. Returns whether all
-// completed. Errors are dropped: they can carry paths or SDK text.
-export async function runCleanup(steps) {
-  let complete = true;
-  for (const step of steps) {
-    if (!step) continue;
+// Runs every [name, step] even if an earlier one fails or hangs, and returns
+// the fixed codes of those that did not complete (empty: all completed). A lock
+// release that throws one of operator-lock's LOCK_RELEASE_* codes keeps that code.
+export async function runCleanupSteps(steps) {
+  const failures = [];
+  for (const entry of steps) {
+    if (!entry) continue;
+    const [name, step] = entry;
     let timer;
     try {
       const finished = await Promise.race([
         Promise.resolve().then(step).then(() => true),
         new Promise((resolve) => { timer = setTimeout(() => resolve(false), CLEANUP_STEP_MS); }),
       ]);
-      if (!finished) complete = false;
-    } catch {
-      complete = false;
+      if (!finished) failures.push(`${name}_TIMEOUT`);
+    } catch (error) {
+      const code = error instanceof LockRefusal && LOCK_FAILURE.test(error.code) ? error.code : `${name}_FAILED`;
+      failures.push(code);
     } finally {
       clearTimeout(timer);
     }
   }
-  return complete;
+  return failures;
+}
+
+// Boolean form, kept for callers that only need complete/incomplete.
+export async function runCleanup(steps) {
+  const failures = await runCleanupSteps(steps.map((step, index) => step && [`STEP_${index}`, step]));
+  return failures.length === 0;
 }
 
 // 1 is the only code that means nothing was written. Every other non-zero code
@@ -468,18 +485,43 @@ export function exitCodeFor(error) {
   return 1;
 }
 
+// R4: the process exit code. Cleanup that did not complete (for example an
+// operator lock that may still be held) adds 10, so it is never 0 and never
+// equal to the same outcome with clean cleanup: 10 completed, 11 refused,
+// 13 unknown, 14 eligibility changed, 15 receipt failed after commit.
+export const CLEANUP_INCOMPLETE_OFFSET = 10;
+export function completionExitCode({ result, error } = {}) {
+  if (error !== undefined) {
+    const base = error instanceof StoreRefusal ? exitCodeFor(error) : 1;
+    return error?.cleanupComplete === false ? base + CLEANUP_INCOMPLETE_OFFSET : base;
+  }
+  return result?.cleanupComplete === false ? CLEANUP_INCOMPLETE_OFFSET : 0;
+}
+
+function cleanupSuffix(failures) {
+  const codes = Array.isArray(failures) ? failures.filter((code) => /^[A-Z0-9_]{1,64}$/.test(code)) : [];
+  return codes.length ? ` ${codes.join(' ')}` : '';
+}
+
 export function failureLine(error) {
   const code = error instanceof StoreRefusal ? error.code : 'STORE_OPERATION_FAILED';
-  const cleanup = error?.cleanupComplete === false ? ' CLEANUP_INCOMPLETE' : '';
+  const cleanup = error?.cleanupComplete === false ? ` CLEANUP_INCOMPLETE${cleanupSuffix(error.cleanupFailures)}` : '';
   return `${exitCodeFor(error) === 1 ? 'STORE_REFUSED' : 'STORE_UNRESOLVED'} ${code}${cleanup}`;
+}
+
+// R4: printed on stderr beside a successful JSON result whose cleanup did not
+// complete. The outcome on stdout stands; the run did not finish cleanly.
+export function cleanupIncompleteLine(result) {
+  return `STORE_CLEANUP_INCOMPLETE${cleanupSuffix(result?.cleanupFailures)} outcome=${/^[a-z-]{1,40}$/.test(result?.outcome || '') ? result.outcome : (result?.dryRun ? 'dry-run' : 'unreported')} do-not-rerun-apply`;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().then((result) => {
     console.log(JSON.stringify(result));
-    process.exit(0);
+    if (result?.cleanupComplete === false) console.error(cleanupIncompleteLine(result));
+    process.exit(completionExitCode({ result }));
   }).catch((error) => {
     console.error(failureLine(error));
-    process.exit(error instanceof StoreRefusal ? exitCodeFor(error) : 1);
+    process.exit(completionExitCode({ error }));
   });
 }
