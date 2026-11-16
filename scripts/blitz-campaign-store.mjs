@@ -269,7 +269,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
   if (opts.apply) {
     const dir = lockDirectory(env);
     try {
-      lock = await acquireOperatorLock({ project: opts.project, purpose: `store-${opts.action}`, dir });
+      lock = await (deps.acquireOperatorLock || acquireOperatorLock)({ project: opts.project, purpose: `store-${opts.action}`, dir });
     } catch (error) {
       const code = error instanceof LockRefusal ? error.code : '';
       if (code === 'LOCK_HELD') throw new StoreRefusal('STORE_OPERATOR_LOCK_HELD');
@@ -280,13 +280,14 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
     try {
       await assertOutsideRepository(path.dirname(lock.file), 'STORE_LOCK_INSIDE_REPOSITORY');
     } catch (error) {
-      await lock.release();
+      await runCleanup([() => lock.release()]);
       throw error;
     }
   }
   let app;
   let deleteApp;
   let firestore;
+  let outcome;
   try {
     const admin = await import('firebase-admin/app');
     deleteApp = admin.deleteApp;
@@ -323,21 +324,54 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
       receiptPath,
       apply: opts.apply,
     });
-    return {
-      target: opts.target,
-      ...result,
-      ...(opts.target === 'production' ? { operatorIdentityBound: true } : {}),
-      ...(input ? { inputFileSha256: input.fileSha256 } : {}),
+    outcome = {
+      result: {
+        target: opts.target,
+        ...result,
+        ...(opts.target === 'production' ? { operatorIdentityBound: true } : {}),
+        ...(input ? { inputFileSha256: input.fileSha256 } : {}),
+      },
     };
   } catch (error) {
     // SDK errors can carry uids, emails or response bodies. Only fixed codes leave.
-    if (error instanceof StoreRefusal) throw error;
-    throw new StoreRefusal('STORE_OPERATION_FAILED');
-  } finally {
-    if (firestore) await Promise.race([firestore.terminate(), new Promise((resolve) => setTimeout(resolve, 3000))]);
-    if (app) await Promise.race([deleteApp(app), new Promise((resolve) => setTimeout(resolve, 3000))]);
-    if (lock) await lock.release();
+    outcome = { error: error instanceof StoreRefusal ? error : new StoreRefusal('STORE_OPERATION_FAILED') };
   }
+  // R4: cleanup never decides the outcome. Each step is attempted, bounded and
+  // contained; a failure is reported alongside the outcome, never instead of it.
+  const cleanupComplete = await runCleanup([
+    firestore && (() => firestore.terminate()),
+    app && (() => deleteApp(app)),
+    lock && (() => lock.release()),
+  ]);
+  if (outcome.error) {
+    if (!cleanupComplete) outcome.error.cleanupComplete = false;
+    throw outcome.error;
+  }
+  return cleanupComplete ? outcome.result : { ...outcome.result, cleanupComplete: false };
+}
+
+const CLEANUP_STEP_MS = 3000;
+
+// Runs every step even if an earlier one fails or hangs. Returns whether all
+// completed. Errors are dropped: they can carry paths or SDK text.
+export async function runCleanup(steps) {
+  let complete = true;
+  for (const step of steps) {
+    if (!step) continue;
+    let timer;
+    try {
+      const finished = await Promise.race([
+        Promise.resolve().then(step).then(() => true),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(false), CLEANUP_STEP_MS); }),
+      ]);
+      if (!finished) complete = false;
+    } catch {
+      complete = false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return complete;
 }
 
 // 1 is the only code that means nothing was written. Every other non-zero code
@@ -351,7 +385,8 @@ export function exitCodeFor(error) {
 
 export function failureLine(error) {
   const code = error instanceof StoreRefusal ? error.code : 'STORE_OPERATION_FAILED';
-  return `${exitCodeFor(error) === 1 ? 'STORE_REFUSED' : 'STORE_UNRESOLVED'} ${code}`;
+  const cleanup = error?.cleanupComplete === false ? ' CLEANUP_INCOMPLETE' : '';
+  return `${exitCodeFor(error) === 1 ? 'STORE_REFUSED' : 'STORE_UNRESOLVED'} ${code}${cleanup}`;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -157,3 +157,87 @@ test('R5: production and emulator Firestore settings disable Commit and channel 
   const service = COMMIT_NO_RETRY_CLIENT_CONFIG.interfaces['google.firestore.v1.Firestore'];
   assert.deepEqual(service.retry_codes[service.methods.Commit.retry_codes_name], []);
 });
+
+// R4: cleanup (lock release, client shutdown) runs in `finally`. A cleanup
+// failure must never replace a committed or unknown outcome with a refusal.
+const { acquireOperatorLock } = await import('../secure/operator-lock.mjs');
+const { exitCodeFor, failureLine } = await import('../scripts/blitz-campaign-store.mjs');
+const failingRelease = (released) => async (options) => {
+  const lock = await acquireOperatorLock(options);
+  return {
+    file: lock.file,
+    async release() {
+      await lock.release();
+      released.push(true);
+      throw Object.assign(new Error('EIO: synthetic cleanup failure /private/path'), { code: 'EIO' });
+    },
+  };
+};
+
+test('R4: a cleanup failure after a verified commit keeps the committed outcome', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  const h = await harness();
+  try {
+    const released = [];
+    const receipt = path.join(h.work, 'receipt.json');
+    const outcome = await main(writeArgs(h, receipt), writeEnv(h), { ...h.deps, acquireOperatorLock: failingRelease(released) })
+      .then((result) => ({ result }), (error) => ({ error }));
+    assert.equal(released.length, 1, 'cleanup ran');
+    assert.equal(h.firestore.state.commits.length, 1);
+    assert.ok(outcome.result, `committed run must not surface as ${outcome.error?.code ?? outcome.error}`);
+    assert.equal(outcome.result.outcome, 'committed-verified');
+    assert.equal(outcome.result.cleanupComplete, false);
+  } finally {
+    await h.close();
+  }
+});
+
+test('R4: a cleanup failure after an unresolved commit keeps STORE_OUTCOME_UNKNOWN (exit 3)', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  let grpcStatus;
+  const h = await harness({ commitFault: (attempt, request, apply) => { apply(); return { code: grpcStatus.UNAVAILABLE, details: 'synthetic' }; } });
+  grpcStatus = h.firestore.grpcStatus;
+  try {
+    const released = [];
+    const receipt = path.join(h.work, 'receipt.json');
+    const error = await main(writeArgs(h, receipt), writeEnv(h), { ...h.deps, acquireOperatorLock: failingRelease(released) }).catch((e) => e);
+    assert.equal(released.length, 1, 'cleanup ran');
+    assert.ok(error instanceof StoreRefusal, `got ${error}`);
+    assert.equal(error.code, 'STORE_OUTCOME_UNKNOWN');
+    assert.equal(exitCodeFor(error), 3);
+    assert.match(failureLine(error), /^STORE_UNRESOLVED STORE_OUTCOME_UNKNOWN CLEANUP_INCOMPLETE$/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('R4: a cleanup failure after a refusal stays a refusal and leaks nothing', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  const h = await harness();
+  try {
+    const released = [];
+    const receipt = path.join(h.work, 'receipt.json');
+    const env = { ...writeEnv(h), BLITZ_STORE_APPROVAL: 'WRITE:wrong' };
+    const error = await main(writeArgs(h, receipt), env, { ...h.deps, acquireOperatorLock: failingRelease(released) }).catch((e) => e);
+    assert.equal(released.length, 1);
+    assert.equal(error.code, 'STORE_APPROVAL_REQUIRED');
+    assert.equal(exitCodeFor(error), 1);
+    assert.doesNotMatch(failureLine(error), /EIO|private/);
+    assert.equal(h.firestore.state.commits.length, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test('R4: runCleanup attempts every step, bounds a hanging one and reports incompleteness', async () => {
+  const { runCleanup } = await import('../scripts/blitz-campaign-store.mjs');
+  const ran = [];
+  const started = Date.now();
+  const complete = await runCleanup([
+    () => { ran.push('throws'); throw new Error('synthetic'); },
+    () => { ran.push('hangs'); return new Promise(() => {}); },
+    null,
+    async () => { ran.push('last'); },
+  ]);
+  assert.equal(complete, false);
+  assert.deepEqual(ran, ['throws', 'hangs', 'last']);
+  assert.ok(Date.now() - started < 10000);
+  assert.equal(await runCleanup([async () => {}, null]), true);
+});

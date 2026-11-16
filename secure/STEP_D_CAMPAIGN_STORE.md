@@ -40,6 +40,8 @@ This tool writes, replaces or retracts the one owner document the secure shell r
 
 Exit 1 prints `STORE_REFUSED <code>`. Exits 3, 4 and 5 print `STORE_UNRESOLVED <code>`: something may have changed.
 
+R4: cleanup (Firestore client shutdown, Admin app deletion, operator lock release) runs after the outcome is fixed, each step bounded to 3 s and contained. A cleanup failure never changes the exit code or the outcome: a failed line gains ` CLEANUP_INCOMPLETE`, and a successful JSON result gains `"cleanupComplete": false`. A lock left behind fails closed (`STORE_OPERATOR_LOCK_HELD`) until a human confirms no run is active and removes it.
+
 ## Producing the envelope (owner, private machine)
 
 Use the **rotated** passphrase, not the one exposed on Oct 31. Use only the private export wrapper: `scripts/build.mjs` on its own writes into the public `docs/` folder whenever `BLITZ_OUTPUT_DIR` is missing. The wrapper refuses an output folder inside the repo, one that is not mode 700 and owned by you, an existing `data.enc.json`, a source inside the repo, a `BLITZ_OUTPUT_DIR` in the environment, and any build flag. It stops if `docs/data.enc.json` or `git status` changed, or if the build left anything but one strict envelope, and removes its staging folder either way. It prints only the envelope digest.
