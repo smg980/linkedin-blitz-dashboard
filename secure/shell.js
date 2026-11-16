@@ -12,7 +12,7 @@ import {
   signInWithRedirect,
   signOut,
 } from 'firebase/auth';
-import { isPopupUnavailable, shouldUseRedirectFirst } from './auth-flow.mjs';
+import { isPopupUnavailable, redirectCanComplete, shouldUseRedirectFirst } from './auth-flow.mjs';
 import { decryptEnvelope } from './envelope.mjs';
 import { readPrivateDocument } from './firestore-get.mjs';
 import { renderPrivateView } from './private-view.mjs';
@@ -122,6 +122,14 @@ function render() {
   $('private-foot').textContent = 'Prep only · decrypted in this browser · not sent';
 }
 
+function redirectContext() {
+  return {
+    authDomain: config?.firebase?.authDomain,
+    hostname: globalThis.location?.hostname,
+    useEmulators: config?.useEmulators === true,
+  };
+}
+
 function googleProvider() {
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: 'select_account' });
@@ -172,7 +180,7 @@ async function onSignIn() {
   session.signInStart();
   render();
   const provider = googleProvider();
-  const redirectFirst = shouldUseRedirectFirst(navigator.userAgent);
+  const redirectFirst = shouldUseRedirectFirst(navigator.userAgent, redirectContext());
   try {
     if (redirectFirst) {
       await signInWithRedirect(auth, provider);
@@ -183,6 +191,13 @@ async function onSignIn() {
     if (credential?.user) await loadDocument(credential.user);
   } catch (error) {
     if (!redirectFirst && isPopupUnavailable(error)) {
+      if (!redirectCanComplete(redirectContext())) {
+        // A redirect could not return a result here; ask for the popup instead.
+        session.signOut();
+        render();
+        $('gate-message').textContent = 'Allow pop-ups for this site, then sign in again.';
+        return;
+      }
       try {
         await setPersistence(auth, browserSessionPersistence);
         await signInWithRedirect(auth, provider);
@@ -293,7 +308,7 @@ async function boot() {
   } catch {
     redirected = null;
   }
-  if (!redirected?.user && !shouldUseRedirectFirst(navigator.userAgent)) {
+  if (!redirected?.user && !shouldUseRedirectFirst(navigator.userAgent, redirectContext())) {
     await setPersistence(auth, inMemoryPersistence);
   }
   if (redirected?.user) await loadDocument(redirected.user);

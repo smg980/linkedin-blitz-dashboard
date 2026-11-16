@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
-import { isPopupUnavailable, shouldUseRedirectFirst } from '../secure/auth-flow.mjs';
+import { isIosSafari, isPopupUnavailable, redirectCanComplete, shouldUseRedirectFirst } from '../secure/auth-flow.mjs';
 import { assertEmulatorTarget } from '../secure/emulator-guard.mjs';
 import { decryptEnvelope, encryptEnvelope, isEnvelope } from '../secure/envelope.mjs';
 import { envelopeFromFirestoreFields, privateDocumentUrl, readPrivateDocument } from '../secure/firestore-get.mjs';
@@ -35,10 +35,30 @@ function fakeRoot(text) {
   return { root: rootNode, input };
 }
 
-test('iPhone Safari uses redirect first and other browsers start with the popup', () => {
-  assert.equal(shouldUseRedirectFirst(IPHONE), true);
-  assert.equal(shouldUseRedirectFirst(DESKTOP), false);
-  assert.equal(shouldUseRedirectFirst(IPHONE.replace('Safari', 'CriOS')), false);
+test('iPhone Safari uses redirect first only where the redirect result can return', () => {
+  const site = 'master-intelligence-5496f-lb.web.app';
+  const crossSite = { authDomain: 'master-intelligence-5496f.firebaseapp.com', hostname: site, useEmulators: false };
+  const sameSite = { authDomain: site, hostname: site, useEmulators: false };
+  const emulator = { authDomain: 'localhost', hostname: '127.0.0.1', useEmulators: true };
+  // Safari 16.1+ blocks the cross-site authDomain storage, so production with
+  // the default firebaseapp.com authDomain must start with the popup.
+  assert.equal(redirectCanComplete(crossSite), false);
+  assert.equal(shouldUseRedirectFirst(IPHONE, crossSite), false);
+  assert.equal(redirectCanComplete(sameSite), true);
+  assert.equal(shouldUseRedirectFirst(IPHONE, sameSite), true);
+  assert.equal(shouldUseRedirectFirst(IPHONE, { ...sameSite, hostname: site.toUpperCase() }), true);
+  assert.equal(shouldUseRedirectFirst(IPHONE, emulator), true);
+  // No context, a missing authDomain, or a lookalike host never selects redirect.
+  assert.equal(shouldUseRedirectFirst(IPHONE), false);
+  assert.equal(shouldUseRedirectFirst(IPHONE, { hostname: site }), false);
+  assert.equal(shouldUseRedirectFirst(IPHONE, { authDomain: '', hostname: '' }), false);
+  assert.equal(shouldUseRedirectFirst(IPHONE, { authDomain: site, hostname: `${site}.attacker.example` }), false);
+  assert.equal(shouldUseRedirectFirst(IPHONE, { ...crossSite, useEmulators: 'true' }), false);
+  assert.equal(shouldUseRedirectFirst(DESKTOP, sameSite), false);
+  assert.equal(shouldUseRedirectFirst(DESKTOP, emulator), false);
+  assert.equal(shouldUseRedirectFirst(IPHONE.replace('Safari', 'CriOS'), sameSite), false);
+  assert.equal(isIosSafari(IPHONE), true);
+  assert.equal(isIosSafari(DESKTOP), false);
   assert.equal(isPopupUnavailable({ code: 'auth/popup-blocked' }), true);
   assert.equal(isPopupUnavailable({ code: 'auth/operation-not-supported-in-this-environment' }), true);
   assert.equal(isPopupUnavailable({ code: 'auth/popup-closed-by-user' }), false);
@@ -193,7 +213,9 @@ test('shell source is read-only and does not touch web storage', async () => {
   const src = await fs.readFile(path.join(root, 'secure', 'shell.js'), 'utf8');
   assert.match(src, /signInWithPopup/);
   assert.match(src, /signInWithRedirect/);
-  assert.match(src, /shouldUseRedirectFirst/);
+  assert.match(src, /shouldUseRedirectFirst\(navigator\.userAgent, redirectContext\(\)\)/);
+  assert.doesNotMatch(src, /shouldUseRedirectFirst\(navigator\.userAgent\)/);
+  assert.match(src, /if \(!redirectCanComplete\(redirectContext\(\)\)\)/);
   assert.match(src, /readPrivateDocument/);
   assert.match(src, /getIdToken\(true\)/);
   const reader = await fs.readFile(path.join(root, 'secure', 'firestore-get.mjs'), 'utf8');
