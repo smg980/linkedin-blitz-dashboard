@@ -30,15 +30,15 @@ const PASS = 'synthetic-operator-clients-passphrase';
 const envelope = await encryptEnvelope(syntheticPayload(), PASS);
 const digest = envelopeDigest(envelope);
 
-async function tempDir(prefix) {
-  return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+async function tempDir(prefix, root = os.tmpdir()) {
+  return fs.realpath(await fs.mkdtemp(path.join(root, prefix)));
 }
 
-async function harness({ commitFault, initialFields, onBatchGet } = {}) {
+async function harness({ commitFault, initialFields, onBatchGet, workRoot } = {}) {
   const firestore = await startFirestoreServer({ tls: TLS, commitFault, initialFields, onBatchGet });
   const identity = await startIdentityToolkit({ tls: TLS, user: syntheticOwnerRecord(UID) });
   const tokens = tokenTransporter();
-  const work = await tempDir('blitz-r3-');
+  const work = await tempDir('blitz-r3-', workRoot);
   const lockDir = path.join(work, 'lock');
   const tokenInfoCalls = [];
   const deps = {
@@ -504,5 +504,221 @@ test('R6: backup and receipt directories must be private to the operator', R6, a
     assert.equal(h.firestore.state.commits.length, 0);
   } finally {
     await h.close();
+  }
+});
+
+// R6 (Codex f82bb16): the descriptor proof raced the path-based open. A parent
+// swapped into the repository just before open, then restored, with a hard link
+// planted after the first fstat, let 3,580 bytes of fictional ciphertext be
+// written into the repository. Every file operation is now anchored to the
+// directory held open since the run started (secure/anchored-dir.mjs). These
+// hooks run real renames, symlinks and links at the actual await boundaries of
+// the anchored create/write/rename; no stat result or writer is replaced.
+// The private directory sits beside the repository (same filesystem) so hard
+// links and renames into the repository are really possible.
+const PARENT = path.dirname(REPO);
+const R6B = { skip: !HAVE_OPENSSL && 'openssl unavailable', timeout: 60000 };
+
+async function boundaryRun({ hooks, initial = true, input: inputEnvelope = envB }) {
+  const target = await swapTarget();
+  const h = await harness({ initialFields: initial ? encodeFields(envelope) : undefined, workRoot: PARENT });
+  assert.equal((await fs.stat(h.work)).dev, (await fs.stat(target)).dev, 'precondition: private dir and repository share a filesystem');
+  const backupDir = path.join(h.work, 'backup-dir');
+  const receiptDir = path.join(h.work, 'receipt-dir');
+  await fs.mkdir(backupDir, { mode: 0o700 });
+  await fs.mkdir(receiptDir, { mode: 0o700 });
+  const input = path.join(h.work, 'envelope-b.json');
+  await fs.writeFile(input, JSON.stringify(inputEnvelope));
+  const ctx = { h, target, backupDir, receiptDir, backupFile: path.join(backupDir, 'backup.json'), receiptFile: path.join(receiptDir, 'receipt.json') };
+  const args = ['write', '--target', 'production', '--project', PRODUCTION_PROJECT, '--input', input,
+    '--expect-current', initial ? digest : 'none', '--receipt', ctx.receiptFile, '--apply',
+    ...(initial ? ['--backup', ctx.backupFile] : [])];
+  const env = { ...writeEnv(h), BLITZ_STORE_APPROVAL: `WRITE:${envelopeDigest(inputEnvelope)}` };
+  const outcome = await main(args, env, { ...h.deps, privateFileHooks: hooks(ctx) }).then((result) => ({ result }), (error) => ({ error }));
+  ctx.outcome = outcome;
+  ctx.leaked = await filesUnder(target);
+  return ctx;
+}
+
+async function finish(ctx) {
+  await fs.rm(ctx.target, { recursive: true, force: true });
+  await ctx.h.close();
+}
+
+function assertNothingInRepository(ctx) {
+  assert.deepEqual(ctx.leaked.filter((f) => f.size > 0).map((f) => `${f.name}:${f.size}`), [], 'no content inside the repository');
+  assert.ok(!ctx.leaked.some((f) => f.text.includes(envelope.ct) || f.text.includes('uidSha256')), 'no ciphertext or receipt inside the repository');
+}
+
+// Runs `fn` once, at the first call of a boundary for the named file.
+const once = (file, fn) => {
+  let done = false;
+  return async (detail) => {
+    if (done || detail?.name !== file) return;
+    done = true;
+    await fn(detail);
+  };
+};
+
+test('R6: Codex sequence — parent swapped into the repository before the open, restored, hard link after the first fstat: no repository content, no commit', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => {
+    const repoFile = path.join(c.target, 'backup.json');
+    return {
+      afterAnchor: async () => {
+        if (c.swapped || !(await fs.lstat(c.backupDir).then(() => true, () => false))) return;
+        if (c.h.firestore.state.commits.length) return;
+        // Only on the backup's anchored section: the receipt was created first.
+        if (!(await fs.lstat(c.receiptFile).then(() => true, () => false))) return;
+        c.swapped = true;
+        await fs.rename(c.backupDir, `${c.backupDir}.moved`);
+        await fs.symlink(c.target, c.backupDir, 'dir');
+      },
+      afterFirstFstat: once('backup.json', async ({ opened }) => {
+        assert.equal(opened.nlink, 1);
+        await fs.unlink(c.backupDir);
+        await fs.rename(`${c.backupDir}.moved`, c.backupDir);
+        // The anchored create landed in the private directory; link it into the repository.
+        await fs.link(c.backupFile, repoFile);
+      }),
+    };
+  } });
+  try {
+    assert.equal(ctx.swapped, true, 'the swap happened');
+    assertNothingInRepository(ctx);
+    assert.deepEqual(ctx.leaked.map((f) => f.name), ['backup.json'], 'only the empty linked artifact');
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.code, 'STORE_BACKUP_FAILED');
+    assert.equal(ctx.outcome.error?.outcome, 'refused-before-write');
+    assert.equal((await fs.stat(ctx.backupFile)).size, 0, 'nothing was written');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: a hard link into the repository planted after the pre-write check is emptied after the write; no commit', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    beforeWrite: once('backup.json', async () => { await fs.link(c.backupFile, path.join(c.target, 'backup.json')); }),
+  }) });
+  try {
+    assert.deepEqual(ctx.leaked.map((f) => `${f.name}:${f.size}`), ['backup.json:0'], 'the planted link holds zero bytes');
+    assertNothingInRepository(ctx);
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.code, 'STORE_BACKUP_FAILED');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: the anchored directory moved into the repository during the write is emptied and refused; no commit', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    beforeWrite: once('backup.json', async () => { await fs.rename(c.backupDir, path.join(c.target, 'moved-private-dir')); }),
+  }) });
+  try {
+    const moved = await filesUnder(path.join(ctx.target, 'moved-private-dir'));
+    assert.deepEqual(moved.map((f) => `${f.name}:${f.size}`), ['backup.json:0']);
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.code, 'STORE_BACKUP_FAILED');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: the directory path swapped into the repository after anchoring cannot redirect create, write or rename', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    afterCreate: once('receipt.json', async () => {
+      await fs.rename(c.receiptDir, `${c.receiptDir}.moved`);
+      await fs.symlink(c.target, c.receiptDir, 'dir');
+    }),
+  }) });
+  try {
+    assertNothingInRepository(ctx);
+    assert.deepEqual(ctx.leaked, []);
+    // The receipt was created in the held directory object, now named .moved;
+    // later sections re-enter by path, find another directory and refuse.
+    assert.ok((await fs.stat(path.join(`${ctx.receiptDir}.moved`, 'receipt.json'))).size > 0);
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.outcome, 'refused-before-write');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: receipt replacement — a link planted on the temp file before the rename is emptied; the commit is still reported (exit 5)', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => {
+    return {
+      beforeRename: async ({ tempName }) => {
+        if (!c.h.firestore.state.commits.length || c.linked) return;
+        c.linked = true;
+        await fs.link(path.join(c.receiptDir, tempName), path.join(c.target, 'receipt.json'));
+      },
+    };
+  } });
+  try {
+    assert.equal(ctx.linked, true);
+    assertNothingInRepository(ctx);
+    assert.equal(ctx.h.firestore.state.commits.length, 1);
+    assert.equal(ctx.outcome.error?.code, 'STORE_RECEIPT_FAILED_AFTER_COMMIT');
+    assert.equal(ctx.outcome.error?.outcome, 'committed-verified');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: receipt replacement — a path swap at the rename boundary keeps the rename inside the held directory', R6B, async () => {
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    beforeRename: async () => {
+      if (!c.h.firestore.state.commits.length || c.swapped) return;
+      c.swapped = true;
+      await fs.rename(c.receiptDir, `${c.receiptDir}.moved`);
+      await fs.symlink(c.target, c.receiptDir, 'dir');
+    },
+  }) });
+  try {
+    assert.equal(ctx.swapped, true);
+    assert.deepEqual(ctx.leaked, [], 'the rename never reached the repository');
+    assert.equal(JSON.parse(await fs.readFile(path.join(`${ctx.receiptDir}.moved`, 'receipt.json'), 'utf8')).status, 'COMMITTED_VERIFIED');
+    assert.equal(ctx.h.firestore.state.commits.length, 1);
+    assert.equal(ctx.outcome.result?.outcome, 'committed-verified');
+  } finally {
+    await finish(ctx);
+  }
+});
+
+test('R6: an entry planted at the anchored name is never followed or overwritten', R6B, async () => {
+  const victim = path.join(REPO, '.r6-victim-');
+  const ctx = await boundaryRun({ hooks: (c) => ({
+    afterAnchor: async () => {
+      if (c.planted || !(await fs.lstat(c.receiptFile).then(() => true, () => false)) || c.h.firestore.state.commits.length) return;
+      c.planted = true;
+      c.victim = await fs.mkdtemp(victim);
+      await fs.writeFile(path.join(c.victim, 'tracked.txt'), 'original\n');
+      await fs.symlink(path.join(c.victim, 'tracked.txt'), c.backupFile);
+    },
+  }) });
+  try {
+    assert.equal(ctx.planted, true);
+    assert.equal(await fs.readFile(path.join(ctx.victim, 'tracked.txt'), 'utf8'), 'original\n');
+    assert.equal(ctx.h.firestore.state.commits.length, 0);
+    assert.equal(ctx.outcome.error?.code, 'STORE_BACKUP_FAILED');
+  } finally {
+    await fs.rm(ctx.victim, { recursive: true, force: true });
+    await finish(ctx);
+  }
+});
+
+test('R6: a clean run through the anchored writers leaves the exact backup and receipt and restores the working directory', R6B, async () => {
+  const cwd = process.cwd();
+  const ctx = await boundaryRun({ hooks: () => ({}) });
+  try {
+    assert.equal(process.cwd(), cwd);
+    assert.equal(ctx.outcome.result?.outcome, 'committed-verified');
+    assert.equal(ctx.outcome.result?.backupWritten, true);
+    assert.equal(envelopeDigest(JSON.parse(await fs.readFile(ctx.backupFile, 'utf8'))), digest);
+    assert.equal((await fs.stat(ctx.backupFile)).mode & 0o777, 0o600);
+    assert.equal(JSON.parse(await fs.readFile(ctx.receiptFile, 'utf8')).status, 'COMMITTED_VERIFIED');
+    assert.deepEqual((await fs.readdir(ctx.receiptDir)).sort(), ['receipt.json'], 'no temp file left');
+    assert.deepEqual(ctx.leaked, []);
+  } finally {
+    await finish(ctx);
   }
 });
