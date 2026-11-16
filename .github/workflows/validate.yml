@@ -42,6 +42,7 @@ jobs:
           node --check tests/firebase-deploy.test.mjs
           node --check tests/mobile-layout.test.mjs
           node --check tests/secure-shell.test.mjs
+          node --check tests/secure-unlock-race.test.mjs
           node --check secure/shell.js
           node --check secure/envelope.mjs
           node --check secure/session.mjs
@@ -55,6 +56,10 @@ jobs:
           node --check secure/private-view.mjs
           node --check scripts/build-secure-shell.mjs
           node --check scripts/verify-secure-shell.mjs
+          node --check scripts/secure-release.mjs
+          node --check tests/secure-release.test.mjs
+          node --check tests/secure-release-deploy.test.mjs
+          node --check tests/helpers/hosting-stubs.mjs
           node --check scripts/ingest-synthetic-emulator.mjs
           node --check scripts/run-secure-suite.mjs
           node --check scripts/secure-browser-check.mjs

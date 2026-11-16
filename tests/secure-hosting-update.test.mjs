@@ -5,12 +5,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertLiveShell } from '../scripts/secure-hosting-guard.mjs';
 import { buildSecureShell } from '../scripts/build-secure-shell.mjs';
+import { SECURE_SHELL_FILES } from '../scripts/verify-secure-shell.mjs';
+import { deployCount, runDeploy } from './helpers/hosting-stubs.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const site = 'master-intelligence-5496f-lb';
@@ -84,6 +86,12 @@ test('live shell guard accepts a production shell and rejects the demo, emulator
     assert.throws(() => assertLiveShell({ ...live, shell: `${live.shell}\nfetch("data.enc.json")` }), /ciphertext/);
     assert.throws(() => assertLiveShell({ ...live, shell: '' }), /missing/);
     assert.throws(() => assertLiveShell({ ...live, html: 'x'.repeat(4 * 1024 * 1024 + 1) }), /oversized/);
+    // F3: weakened policies and extra scripts are refused, not just a missing CSP.
+    assert.throws(() => assertLiveShell({ ...live, html: live.html.replace("script-src 'self'", "script-src 'self' 'unsafe-inline'") }), /exact production policy/);
+    assert.throws(() => assertLiveShell({ ...live, html: live.html.replace("script-src 'self'", "script-src 'self' 'unsafe-eval'") }), /exact production policy/);
+    assert.throws(() => assertLiveShell({ ...live, html: live.html.replace("script-src 'self'", "script-src 'self' https://cdn.example") }), /exact production policy/);
+    assert.throws(() => assertLiveShell({ ...live, html: live.html.replace('</body>', '<script src="analytics.js" defer></script></body>') }), /scripts other than/);
+    assert.throws(() => assertLiveShell({ ...live, html: live.html.replace('</body>', '<script>alert(1)</script></body>') }), /scripts other than/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -133,240 +141,140 @@ test('release baseline must be demo or shell and pairs with exactly one expected
   }
 });
 
-// Runs the real deploy script, in a repository copy, with stubbed cloud tools.
-// mode:
-//   ok             live shell baseline, deploy, live files equal the build
-//   live-is-demo   the fictional demo is live (app.js page, ciphertext 200)
-//   wrong-release  the operator-supplied release is not the live one
-//   cipher-live    a shell page is live but /data.enc.json is still served
-//   post-mismatch  after deploy the live shell.js is not the local build
-//   demo-baseline  default demo baseline while a shell is live (today's production)
-async function runUpdate(mode) {
-  const work = await mkdtemp(path.join(os.tmpdir(), 'blitz-hosting-update-'));
-  const repo = path.join(work, 'repo');
-  const bin = path.join(work, 'bin');
-  const state = path.join(work, 'state');
-  const tmp = path.join(work, 'tmp');
-  try {
-    await mkdir(tmp);
-    await mkdir(repo);
-    await mkdir(bin);
-    await mkdir(state);
-    for (const entry of ['scripts', 'secure', 'docs']) {
-      await cp(path.join(root, entry), path.join(repo, entry), { recursive: true });
-    }
-    for (const file of ['firebase.secure-blitz.json', '.firebaserc', 'package.json']) {
-      await cp(path.join(root, file), path.join(repo, file));
-    }
-    await symlink(path.join(root, 'node_modules'), path.join(repo, 'node_modules'), 'dir');
-    const operatorConfig = path.join(work, 'secure-config.local.json');
-    await writeFile(operatorConfig, JSON.stringify(webConfig()), { mode: 0o600 });
-    const previousShell = await builtShell(work, 'AIzaSyPREVIOUSLIVESHELLKEY0000000000000');
-    const demoDir = path.join(work, 'demo');
-    await mkdir(demoDir);
-    await cp(path.join(root, 'docs', 'index.html'), path.join(demoDir, 'index.html'));
-    await writeFile(path.join(demoDir, 'config.js'), '// demo has no secure config\n');
-    await writeFile(path.join(demoDir, 'shell.js'), '// demo has no shell\n');
-    const sites = path.join(work, 'sites.json');
-    await writeFile(sites, JSON.stringify({
-      status: 'success',
-      result: { sites: [project, `${project}-app`, `${project}-prep`, site].map((id) => ({ name: `projects/${project}/sites/${id}` })) },
-    }));
-    const logs = { firebase: path.join(work, 'firebase.log'), npm: path.join(work, 'npm.log'), curl: path.join(work, 'curl.log') };
-    for (const file of Object.values(logs)) await writeFile(file, '');
+// The shell -> shell update path runs the real deploy script against the shared
+// stub harness (tests/helpers/hosting-stubs.mjs); see that file for each mode.
+const ROLLBACK = new RegExp(`STEP_C_ROLLBACK_COMMAND=firebase hosting:clone --project ${project} --non-interactive ${site}@${versionBefore} ${site}:live`);
 
-    await exe(path.join(bin, 'git'), `#!/bin/sh
-case "$1" in
-  rev-parse) printf '%s\\n' "$BLITZ_APPROVED_COMMIT" ;;
-  status) ;;
-  *) echo "unexpected git: $*" >&2; exit 1 ;;
-esac
-`);
-    await exe(path.join(bin, 'gcloud'), `#!/bin/sh
-case " $* " in
-  *' print-access-token '*) printf '%s\\n' 'ya29.synthetic-hosting-update-token-for-tests' ;;
-  *) printf '%s\\n' False ;;
-esac
-`);
-    await exe(path.join(bin, 'firebase'), `#!/bin/sh
-printf '%s\\n' "$*" >> "$STUB_FIREBASE_LOG"
-case " $* " in
-  *' deploy '*) printf '%s\\n' DEPLOY >> "$STUB_FIREBASE_LOG"; : > "$STUB_STATE/deployed"; exit 0 ;;
-  *' hosting:sites:list '*) cat "$STUB_SITES" ;;
-  *) echo "unexpected firebase: $*" >&2; exit 1 ;;
-esac
-`);
-    await exe(path.join(bin, 'npm'), `#!/bin/sh
-printf '%s\\n' "$*" >> "$STUB_NPM_LOG"
-for name in BLITZ_APPROVE_SECURE_SHELL_DEPLOY BLITZ_APPROVED_COMMIT BLITZ_EXPECTED_DEMO_RELEASE BLITZ_EXPECTED_LIVE_RELEASE BLITZ_RELEASE_BASELINE; do
-  if env | grep -q "^$name="; then printf '%s\\n' "APPROVAL_VAR_PRESENT $name" >> "$STUB_NPM_LOG"; fi
-done
-if [ "$1" = run ] && [ "$2" = test:secure ]; then
-  printf '%s\\n' "nonce=$BLITZ_SECURE_ATTEST_NONCE" tests=7 pass=7 fail=0 cancelled=0 skipped=0 todo=0 iphone=pass > "$BLITZ_SECURE_ATTEST_PATH"
-fi
-exit 0
-`);
-    await exe(path.join(bin, 'curl'), `#!${process.execPath}
-const fs = require('node:fs');
-const path = require('node:path');
-const args = process.argv.slice(2);
-const env = process.env;
-let out = null; let writeOut = null; let fail = false; const headers = [];
-let url = null;
-for (let i = 0; i < args.length; i++) {
-  const a = args[i];
-  if (a === '-o' || a === '--output') out = args[++i];
-  else if (a === '--write-out') writeOut = args[++i];
-  else if (a === '-H') headers.push(args[++i]);
-  else if (a === '--max-time' || a === '--retry') i++;
-  else if (a === '--fail') fail = true;
-  else if (a === '-L' || a === '--location') { process.stderr.write('redirects not allowed'); process.exit(2); }
-  else if (/^https:\\/\\//.test(a)) url = a;
-}
-fs.appendFileSync(env.STUB_CURL_LOG, url + '\\n');
-const deployed = fs.existsSync(path.join(env.STUB_STATE, 'deployed'));
-const mode = env.STUB_MODE;
-const site = 'https://${site}.web.app';
-let status = 404; let body = '';
-if (url === 'https://firebasehosting.googleapis.com/v1beta1/sites/${site}/channels/live') {
-  const auth = headers.find((h) => h.startsWith('@'));
-  if (!auth || !/^Authorization: Bearer ya29\\./.test(fs.readFileSync(auth.slice(1), 'utf8'))) { status = 401; }
-  else {
-    status = 200;
-    const release = deployed ? '${releaseAfter}' : '${releaseBefore}';
-    const version = deployed ? '${versionAfter}' : '${versionBefore}';
-    body = JSON.stringify({ name: 'sites/${site}/channels/live', url: site, release: { name: release, type: 'DEPLOY', version: { name: 'sites/${site}/versions/' + version, status: 'FINALIZED' } } });
-  }
-} else {
-  const demoLive = !deployed && (mode === 'live-is-demo');
-  const dir = deployed ? env.STUB_POST_DIR : (demoLive ? env.STUB_DEMO_DIR : env.STUB_PRE_DIR);
-  const name = url === site + '/' ? 'index.html' : url.slice(site.length + 1);
-  if (name === 'data.enc.json') {
-    if (demoLive || (mode === 'cipher-live' && !deployed)) { status = 200; body = fs.readFileSync(env.STUB_CIPHER, 'utf8'); }
-  } else if (['index.html', 'config.js', 'shell.js'].includes(name)) {
-    status = 200; body = fs.readFileSync(path.join(dir, name), 'utf8');
-    if (deployed && mode === 'post-mismatch' && name === 'shell.js') body += '\\n// tampered after deploy\\n';
-  }
-}
-if (fail && status >= 400) { process.stderr.write('curl: (22) The requested URL returned error: ' + status + '\\n'); process.exit(22); }
-if (out && out !== '/dev/null') fs.writeFileSync(out, body);
-else if (!out) process.stdout.write(body);
-if (writeOut === '%{http_code}') process.stdout.write(String(status));
-`);
-    const env = cleanEnv({
-      PATH: `${bin}:${process.env.PATH}`,
-      BLITZ_APPROVE_SECURE_SHELL_DEPLOY: 'YES',
-      BLITZ_APPROVED_COMMIT: approved,
-      BLITZ_SECURE_CONFIG: operatorConfig,
-      TMPDIR: tmp,
-      STUB_MODE: mode,
-      STUB_STATE: state,
-      STUB_SITES: sites,
-      STUB_FIREBASE_LOG: logs.firebase,
-      STUB_NPM_LOG: logs.npm,
-      STUB_CURL_LOG: logs.curl,
-      STUB_PRE_DIR: previousShell,
-      STUB_DEMO_DIR: demoDir,
-      STUB_POST_DIR: path.join(repo, '.firebase-blitz-private-shell'),
-      STUB_CIPHER: path.join(root, 'docs', 'data.enc.json'),
-    });
-    if (mode === 'demo-baseline') {
-      env.BLITZ_EXPECTED_DEMO_RELEASE = releaseBefore;
-    } else {
-      env.BLITZ_RELEASE_BASELINE = 'shell';
-      env.BLITZ_EXPECTED_LIVE_RELEASE = mode === 'wrong-release' ? `sites/${site}/channels/live/releases/1` : releaseBefore;
-    }
-    const result = spawnSync('bash', [path.join(repo, 'scripts', 'deploy-secure-blitz.sh')], {
-      cwd: repo, encoding: 'utf8', timeout: 240000, env,
-    });
-    const read = async (file) => readFile(file, 'utf8');
-    // Scratch directories (fetched live files, token) must be gone on every exit path.
-    const leftovers = (await readdir(tmp, { withFileTypes: true })).filter((e) => e.isDirectory()).map((e) => e.name);
-    return {
-      result,
-      firebase: await read(logs.firebase),
-      npm: await read(logs.npm),
-      curl: await read(logs.curl),
-      leftovers,
-    };
-  } finally {
-    await rm(work, { recursive: true, force: true });
-  }
+function runUpdate(mode, baseline = 'shell') {
+  return runDeploy({ mode, baseline, buildShell: builtShell });
 }
 
 function assertClean(run) {
-  assert.deepEqual(run.leftovers, [], 'scratch directories were left behind');
+  assert.deepEqual(run.tmpLeftovers, [], 'scratch directories were left behind');
+  assert.doesNotMatch(`${run.result.stdout}\n${run.result.stderr}`, /ya29\./);
 }
 
-function deployCount(text) {
-  return text.split('\n').filter((line) => line === 'DEPLOY').length;
+function count(text, url) {
+  return text.split('\n').filter((u) => u === url).length;
 }
 
-test('shell baseline: one hosting:blitz deploy, exact rollback, live files equal the approved build', { timeout: 300000 }, async () => {
+test('shell baseline: one hosting:blitz deploy from the frozen release, exact rollback, every live byte equals the manifest', { timeout: 300000 }, async () => {
   const run = await runUpdate('ok');
   assertClean(run);
   const { result, firebase, npm, curl } = run;
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.equal(deployCount(firebase), 1);
-  assert.match(firebase, /^deploy --config firebase\.secure-blitz\.json --only hosting:blitz --project master-intelligence-5496f --non-interactive$/m);
+  assert.match(firebase, /^deploy --config \S+\/blitz-release-[^/\s]+\/firebase\.json --only hosting:blitz --project master-intelligence-5496f --non-interactive$/m);
   assert.doesNotMatch(firebase, /hosting:clone|hosting:disable|firestore|functions|storage/);
+  assert.deepEqual(run.deployedFiles, SECURE_SHELL_FILES);
   assert.match(result.stdout, /^STEP_C_BASELINE=shell$/m);
   assert.match(result.stdout, new RegExp(`^STEP_C_LIVE_RELEASE=${releaseBefore}$`, 'm'));
   assert.match(result.stdout, new RegExp(`^STEP_C_NEW_RELEASE=${releaseAfter}$`, 'm'));
-  assert.match(result.stdout, new RegExp(`^STEP_C_ROLLBACK_COMMAND=firebase hosting:clone --project ${project} --non-interactive ${site}@${versionBefore} ${site}:live$`, 'm'));
+  assert.match(result.stdout, ROLLBACK);
+  assert.match(result.stdout, /^STEP_C_RELEASE_MANIFEST_SHA256=[0-9a-f]{64}$/m);
   assert.match(result.stdout, /STEP_C_DEPLOY_VERIFIED/);
   assert.doesNotMatch(npm, /APPROVAL_VAR_PRESENT/);
-  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /ya29\./);
-  // Baseline read: shell files and ciphertext 404 before deploy; same three files after.
-  assert.equal(curl.split('\n').filter((u) => u === `https://${site}.web.app/shell.js`).length, 2);
-  assert.equal(curl.split('\n').filter((u) => u === `https://${site}.web.app/data.enc.json`).length, 2);
+  // Every shell path and "/" before (baseline) and after (manifest); the rollback version's and new version's file lists.
+  assert.equal(count(curl, `https://${site}.web.app/shell.js`), 2);
+  assert.equal(count(curl, `https://${site}.web.app/fonts/Manrope-latin.woff2`), 2);
+  assert.equal(count(curl, `https://${site}.web.app/data.enc.json`), 2);
+  assert.equal(count(curl, `https://firebasehosting.googleapis.com/v1beta1/sites/${site}/versions/${versionBefore}/files`), 1);
+  assert.equal(count(curl, `https://firebasehosting.googleapis.com/v1beta1/sites/${site}/versions/${versionAfter}/files`), 1);
 });
 
 test('shell baseline refuses a live fictional demo before deploy', { timeout: 300000 }, async () => {
   const run = await runUpdate('live-is-demo');
   assertClean(run);
-  const { result, firebase } = run;
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /not a production secure shell/);
-  assert.equal(deployCount(firebase), 0);
-  assert.doesNotMatch(result.stderr, /STEP_C_ROLLBACK_COMMAND/);
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /not a production secure shell/);
+  assert.equal(deployCount(run.firebase), 0);
+  assert.doesNotMatch(run.result.stderr, /STEP_C_ROLLBACK_COMMAND/);
 });
 
 test('shell baseline refuses a live shell that still serves public ciphertext', { timeout: 300000 }, async () => {
   const run = await runUpdate('cipher-live');
   assertClean(run);
-  const { result, firebase } = run;
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /not a production secure shell with no public ciphertext/);
-  assert.equal(deployCount(firebase), 0);
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /not a production secure shell with no public ciphertext/);
+  assert.equal(deployCount(run.firebase), 0);
 });
 
 test('shell baseline refuses when the live release is not the operator-verified one', { timeout: 300000 }, async () => {
   const run = await runUpdate('wrong-release');
   assertClean(run);
-  const { result, firebase } = run;
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /does not equal the explicitly verified shell release/);
-  assert.equal(deployCount(firebase), 0);
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /does not equal the explicitly verified shell release/);
+  assert.equal(deployCount(run.firebase), 0);
 });
 
-test('a live shell that differs from the approved build after deploy fails and prints the exact rollback', { timeout: 300000 }, async () => {
-  const run = await runUpdate('post-mismatch');
+test('a live shell that differs from the frozen release after deploy fails and prints the exact rollback', { timeout: 300000 }, async () => {
+  const run = await runUpdate('cdn-mismatch');
   assertClean(run);
-  const { result, firebase } = run;
-  assert.notEqual(result.status, 0);
-  assert.equal(deployCount(firebase), 1);
-  assert.match(result.stderr, /not byte-identical to the approved local build/);
-  assert.match(result.stderr, new RegExp(`STEP_C_ROLLBACK_COMMAND=firebase hosting:clone --project ${project} --non-interactive ${site}@${versionBefore} ${site}:live`));
-  assert.doesNotMatch(result.stdout, /STEP_C_DEPLOY_VERIFIED/);
-  assert.doesNotMatch(firebase, /hosting:clone/);
+  assert.notEqual(run.result.status, 0);
+  assert.equal(deployCount(run.firebase), 1);
+  assert.match(run.result.stderr, /do not match the frozen release/);
+  assert.match(run.result.stderr, ROLLBACK);
+  assert.doesNotMatch(run.result.stdout, /STEP_C_DEPLOY_VERIFIED/);
+  assert.doesNotMatch(run.firebase, /hosting:clone/);
 });
 
 test('the default demo baseline cannot overwrite an already-live shell', { timeout: 300000 }, async () => {
-  const run = await runUpdate('demo-baseline');
+  const run = await runUpdate('demo-baseline-shell-live', 'demo');
   assertClean(run);
-  const { result, firebase } = run;
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Cannot verify existing fictional demo/);
-  assert.equal(deployCount(firebase), 0);
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /Cannot verify existing fictional demo/);
+  assert.equal(deployCount(run.firebase), 0);
 });
+
+// F3: the rollback baseline itself must pass the exact live checks before
+// anything is deployed over it.
+for (const [mode, label] of [
+  ['baseline-weak-csp', 'a CSP header weakened with unsafe-inline'],
+  ['baseline-no-xfo', 'a missing X-Frame-Options header'],
+  ['baseline-report-only', 'an added report-only CSP'],
+  ['baseline-dup-csp', 'a second CSP header'],
+  ['baseline-redirect', 'a redirect on shell.js'],
+  ['baseline-missing-404', 'a shell file that answers 404'],
+  ['baseline-extra-script', 'an unrelated script in the page'],
+]) {
+  test(`F3: a live shell baseline with ${label} is refused before deploy`, { timeout: 300000 }, async () => {
+    const run = await runUpdate(mode);
+    assertClean(run);
+    assert.notEqual(run.result.status, 0, `${run.result.stdout}\n${run.result.stderr}`);
+    assert.match(run.result.stderr, /not a production secure shell with no public ciphertext/);
+    assert.equal(deployCount(run.firebase), 0);
+    assert.doesNotMatch(run.result.stderr, /STEP_C_ROLLBACK_COMMAND/);
+  });
+}
+
+test('F3: a shell rollback version that lists any extra file is refused before deploy', { timeout: 300000 }, async () => {
+  const run = await runUpdate('rollback-extra');
+  assertClean(run);
+  assert.notEqual(run.result.status, 0);
+  assert.match(run.result.stderr, /not exactly a secure shell; it is not a trustworthy baseline/);
+  assert.equal(deployCount(run.firebase), 0);
+});
+
+// F2 on the update path: same frozen-release guarantees as the first release.
+test('F2: on the update path a fictional export in the build directory is never deployed', { timeout: 300000 }, async () => {
+  const run = await runUpdate('export-in-build-dir');
+  assertClean(run);
+  assert.equal(run.result.status, 0, `${run.result.stdout}\n${run.result.stderr}`);
+  assert.deepEqual(run.deployedFiles, SECURE_SHELL_FILES);
+});
+
+for (const [mode, pattern] of [
+  ['tamper-during-deploy', /Frozen release changed during deploy|not exactly the frozen manifest/],
+  ['weak-csp', /do not match the frozen release/],
+  ['redirect', /do not match the frozen release/],
+]) {
+  test(`F2/F3: on the update path ${mode} after deploy fails and prints the exact rollback`, { timeout: 300000 }, async () => {
+    const run = await runUpdate(mode);
+    assertClean(run);
+    assert.notEqual(run.result.status, 0);
+    assert.equal(deployCount(run.firebase), 1);
+    assert.match(run.result.stderr, pattern);
+    assert.match(run.result.stderr, ROLLBACK);
+    assert.doesNotMatch(run.result.stdout, /STEP_C_DEPLOY_VERIFIED/);
+  });
+}

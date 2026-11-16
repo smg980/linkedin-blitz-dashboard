@@ -2,6 +2,7 @@
 // This file never writes to Firebase. The deploy wrapper runs all cloud reads.
 import fs from 'node:fs';
 import path from 'node:path';
+import { productionCsp } from '../secure/csp.mjs';
 import { verifySecureShell, SECURE_OUT } from './verify-secure-shell.mjs';
 import { assertExactSiteListed, PROJECT, SITE, TARGET } from './blitz-hosting-guard.mjs';
 
@@ -111,15 +112,24 @@ export function assertLiveShell({ html, config, shell }) {
       throw new Error(`Live ${name} is missing or oversized`);
     }
   }
-  if (!html.includes('<meta http-equiv="Content-Security-Policy" content="default-src \'self\';')) {
-    throw new Error('Live shell has no production Content-Security-Policy');
+  const metas = [...html.matchAll(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)"\s*>/gi)];
+  if (metas.length !== 1) throw new Error('Live shell has no production Content-Security-Policy');
+  // F3: the exact approved policy. A weakened script-src, unsafe-inline/eval or a
+  // missing frame-ancestors is a different string and is refused.
+  if (metas[0][1] !== productionCsp()) {
+    throw new Error(/frame-ancestors 'none'/.test(metas[0][1])
+      ? 'Live shell CSP is not the exact production policy'
+      : 'Live shell CSP does not deny framing');
   }
-  if (!/frame-ancestors 'none'/.test(html)) throw new Error('Live shell CSP does not deny framing');
   for (const marker of ['<script src="config.js" defer></script>', '<script src="shell.js" defer></script>', 'id="unlock-form"']) {
     if (!html.includes(marker)) throw new Error('Live page is not the secure shell');
   }
   if (/data\.enc\.json|src="app\.js"|useEmulators"\s*:\s*true/.test(html)) {
     throw new Error('Live page references the public demo or emulator');
+  }
+  const scripts = [...html.matchAll(/<script\b[^>]*>/gi)].map((m) => m[0]);
+  if (scripts.length !== 2 || /\son[a-z]+\s*=|javascript:/i.test(html)) {
+    throw new Error('Live page runs scripts other than config.js and shell.js');
   }
   assertPrivateWebConfig(config);
   if (/data\.enc\.json/.test(shell)) throw new Error('Live shell script references public ciphertext');

@@ -188,7 +188,7 @@ test('release cli prints only the clone id and drops account identifiers', () =>
 test('secure deploy script can target only hosting:blitz and prints an exact clone rollback', () => {
   assert.equal(spawnSync('bash', ['-n', 'scripts/deploy-secure-blitz.sh'], { encoding: 'utf8', env: cleanChildEnv() }).status, 0);
   assert.deepEqual(scriptCode.match(/firebase deploy[^\n]*/g), [
-    'firebase deploy --config firebase.secure-blitz.json --only "hosting:$TARGET" --project "$PROJECT" --non-interactive',
+    'firebase deploy --config "${release_root}/firebase.json" --only "hosting:$TARGET" --project "$PROJECT" --non-interactive',
   ]);
   assert.deepEqual(scriptCode.match(/firebase hosting:clone[^\n]*/g), [
     'firebase hosting:clone --project ${PROJECT} --non-interactive ${SITE}@${previous_version_id} ${SITE}:live"',
@@ -214,7 +214,19 @@ test('secure deploy script can target only hosting:blitz and prints an exact clo
   assert.equal([...scriptCode.matchAll(/secure-hosting-guard\.mjs --assert-config \|\| stop 'Private Hosting config check failed\.'/g)].length, 2);
   assert.equal([...scriptCode.matchAll(/secure-hosting-guard\.mjs --assert-shell \|\| stop 'Secure shell output check failed\.'/g)].length, 2);
   assert.match(scriptCode, /build-secure-shell\.mjs --config "\$\{BLITZ_SECURE_CONFIG:-secure-config\.local\.json\}" \|\| stop 'Secure shell build failed\.'/);
-  const deployAt = scriptCode.indexOf('firebase deploy --config firebase.secure-blitz.json --only "hosting:$TARGET" --project "$PROJECT" --non-interactive');
+  const deployAt = scriptCode.indexOf('firebase deploy --config "${release_root}/firebase.json" --only "hosting:$TARGET" --project "$PROJECT" --non-interactive');
+  assert.ok(deployAt > 0);
+  // F2: freeze after the last build check; re-verify the frozen bytes on both sides of the deploy.
+  const freezeAt = scriptCode.indexOf('node scripts/secure-release.mjs --freeze .firebase-blitz-private-shell');
+  const lastShellCheck = scriptCode.lastIndexOf("secure-hosting-guard.mjs --assert-shell || stop 'Secure shell output check failed.'");
+  assert.ok(lastShellCheck > 0 && freezeAt > lastShellCheck && freezeAt < deployAt);
+  assert.ok(scriptCode.indexOf("--verify-frozen \"$release_root\" \"$manifest_sha\" || stop 'Frozen release changed before deploy.'") < deployAt);
+  assert.ok(scriptCode.indexOf("--verify-frozen \"$release_root\" \"$manifest_sha\" || stop 'Frozen release changed during deploy.'") > deployAt);
+  assert.ok(scriptCode.indexOf('--version-files-demo') < deployAt, 'rollback target checked before deploy');
+  assert.ok(scriptCode.indexOf('--version-files "$release_root" "$manifest_sha"') > deployAt);
+  assert.ok(scriptCode.indexOf("verify_live_release || stop") > deployAt);
+  assert.ok(scriptCode.indexOf("verify_live_release || stop") < scriptCode.indexOf('deploy_verified=1'));
+  assert.equal(scriptCode.split('.firebase-blitz-private-shell').length, 2, 'only the freeze reads the build directory');
   const attestCalls = [...scriptCode.matchAll(/require_suite_attestation \|\| stop 'Secure suite attestation is missing or does not match this run\.'/g)];
   assert.equal(attestCalls.length, 2);
   assert.ok(attestCalls.every((match) => match.index < deployAt));

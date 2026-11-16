@@ -12,17 +12,21 @@ Before anything is deployed:
 - `BLITZ_RELEASE_BASELINE=shell` together with `BLITZ_EXPECTED_LIVE_RELEASE`. Setting `BLITZ_EXPECTED_DEMO_RELEASE` as well is refused.
 - `hosting:blitz` mapping, hosting-only config, billing `False`, and the exact site listed.
 - `npm test`, `verify:bundle`, and `test:secure` with a fresh 7/7 iPhone attestation. Approval variables are kept out of the test processes.
-- A production build from the untracked web config, verified as 15 files with no ciphertext.
+- A production build from the untracked web config, verified as 15 files with no ciphertext, then **frozen once** into a private release root under `TMPDIR` (outside the repository): read-only copies of the 15 files plus a SHA-256 manifest. Its digest is printed as `STEP_C_RELEASE_MANIFEST_SHA256`. Nothing after this reads `.firebase-blitz-private-shell`.
 - The live channel's current release equals `BLITZ_EXPECTED_LIVE_RELEASE`.
-- The live site is a production secure shell: `/`, `/config.js` and `/shell.js` carry the shell markers, the production CSP and a production web config, and `/data.enc.json` returns 404.
+- The live site is an exact production secure shell. Every one of the 15 shell paths and `/` answers **200 with no redirect**, with exactly one of each header in `firebase.secure-blitz.json` at its exact value (CSP equal to the production policy, `X-Frame-Options: DENY`, `Cache-Control: no-store`, …) and no report-only CSP. The page carries the exact production meta CSP and loads only `config.js` and `shell.js`; `config.js` is the production web config; `/data.enc.json` returns 404.
+- The live version that the rollback would restore lists **exactly** the 15 shell files in the Hosting API, so a rollback cannot republish anything else.
+- The frozen release still matches its manifest.
 - A second read of the live channel immediately before deploying. Any change stops the run.
 
-The deploy is one `firebase deploy --config firebase.secure-blitz.json --only hosting:blitz --project master-intelligence-5496f --non-interactive`.
+The deploy is one `firebase deploy --config <release root>/firebase.json --only hosting:blitz --project master-intelligence-5496f --non-interactive`. That config is the approved `firebase.secure-blitz.json` with `public` pointed at the frozen copy.
 
 After the deploy:
 
 - The release changed, `/` returns 200, `/data.enc.json` returns 404, and billing is `False`.
-- The live `index.html`, `config.js` and `shell.js` are **byte-identical** to the local build of the approved commit.
+- The frozen release still matches its manifest (nothing changed it during the upload).
+- The new Hosting version lists exactly the manifest's files.
+- Every manifest file and `/` is **byte-identical** to the manifest and passes the same status, redirect, header, CSP and script checks as the baseline.
 
 Any failure after the deploy prints `STEP_C_ROLLBACK_COMMAND` and stops. It never retries.
 
@@ -45,7 +49,7 @@ export BLITZ_EXPECTED_LIVE_RELEASE='<release.name from the read above>'
 BLITZ_APPROVE_SECURE_SHELL_DEPLOY=YES bash scripts/deploy-secure-blitz.sh
 ```
 
-Record `STEP_C_LIVE_RELEASE`, `STEP_C_NEW_RELEASE` and `STEP_C_ROLLBACK_COMMAND`. Do not post tokens, UIDs or emails.
+Record `STEP_C_LIVE_RELEASE`, `STEP_C_NEW_RELEASE`, `STEP_C_RELEASE_MANIFEST_SHA256` and `STEP_C_ROLLBACK_COMMAND`. Do not post tokens, UIDs or emails.
 
 ## Rollback
 
