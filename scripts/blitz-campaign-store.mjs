@@ -10,10 +10,11 @@
 // All arguments and variables are validated before the Admin SDK is loaded.
 // Output is JSON with booleans and envelope digests only.
 //
-// Exit codes: 0 committed and verified (or a dry run); 1 refused, nothing was
-// written; 3 STORE_OUTCOME_UNKNOWN, the write may have applied, read the
-// receipt and inspect, never re-run the same apply; 4 committed but the owner
-// record changed during the commit, read the receipt.
+// Exit codes: 0 committed and verified (or a dry run); 1 STORE_REFUSED, nothing
+// was written; 3 STORE_UNRESOLVED STORE_OUTCOME_UNKNOWN, the write may have
+// applied, read the receipt and inspect, never re-run the same apply; 4 committed
+// but the owner record changed during the commit; 5 committed and verified but
+// the receipt could not record it. Read the receipt for 3-5.
 //
 // F4: production uses only the operator's gcloud user ADC file (checked, then
 // handed to the SDK explicitly) and requires it to belong to the account the
@@ -267,12 +268,20 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
   let lock = null;
   if (opts.apply) {
     const dir = lockDirectory(env);
-    await fs.mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => {});
-    await assertOutsideRepository(await fs.realpath(dir).catch(() => path.resolve(dir)), 'STORE_LOCK_INSIDE_REPOSITORY');
     try {
       lock = await acquireOperatorLock({ project: opts.project, purpose: `store-${opts.action}`, dir });
     } catch (error) {
-      throw new StoreRefusal(error instanceof LockRefusal && error.code === 'LOCK_HELD' ? 'STORE_OPERATOR_LOCK_HELD' : 'STORE_OPERATOR_LOCK_UNAVAILABLE');
+      const code = error instanceof LockRefusal ? error.code : '';
+      if (code === 'LOCK_HELD') throw new StoreRefusal('STORE_OPERATOR_LOCK_HELD');
+      if (code === 'LOCK_DIRECTORY_INSIDE_REPOSITORY') throw new StoreRefusal('STORE_LOCK_INSIDE_REPOSITORY');
+      throw new StoreRefusal('STORE_OPERATOR_LOCK_UNAVAILABLE');
+    }
+    // The lock file itself must also sit outside the repository by file identity.
+    try {
+      await assertOutsideRepository(path.dirname(lock.file), 'STORE_LOCK_INSIDE_REPOSITORY');
+    } catch (error) {
+      await lock.release();
+      throw error;
     }
   }
   let app;
@@ -324,10 +333,18 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
   }
 }
 
+// 1 is the only code that means nothing was written. Every other non-zero code
+// is printed as STORE_UNRESOLVED so it is never mistaken for a refusal.
 export function exitCodeFor(error) {
   if (error?.outcome === 'unknown') return 3;
   if (error?.outcome === 'committed-eligibility-changed') return 4;
+  if (error?.outcome === 'committed-verified') return 5;
   return 1;
+}
+
+export function failureLine(error) {
+  const code = error instanceof StoreRefusal ? error.code : 'STORE_OPERATION_FAILED';
+  return `${exitCodeFor(error) === 1 ? 'STORE_REFUSED' : 'STORE_UNRESOLVED'} ${code}`;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -335,8 +352,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     console.log(JSON.stringify(result));
     process.exit(0);
   }).catch((error) => {
-    const code = error instanceof StoreRefusal ? error.code : 'STORE_OPERATION_FAILED';
-    console.error(`STORE_REFUSED ${code}`);
+    console.error(failureLine(error));
     process.exit(error instanceof StoreRefusal ? exitCodeFor(error) : 1);
   });
 }

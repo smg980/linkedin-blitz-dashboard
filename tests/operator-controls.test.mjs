@@ -13,7 +13,7 @@ import { encryptEnvelope } from '../secure/envelope.mjs';
 import { isCredentialEnvKey, PRODUCTION_PROJECT, StoreRefusal } from '../secure/campaign-store.mjs';
 import { acquireOperatorLock } from '../secure/operator-lock.mjs';
 import { syntheticPayload } from '../secure/synthetic-contacts.mjs';
-import { bindOperatorIdentity, loadOperatorCredential, main } from '../scripts/blitz-campaign-store.mjs';
+import { bindOperatorIdentity, exitCodeFor, failureLine, loadOperatorCredential, main } from '../scripts/blitz-campaign-store.mjs';
 import { runSyntheticOwnerAction } from '../scripts/d0-owner-emulator.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -238,4 +238,24 @@ test('claim race control: the D0 claim tool takes the same lock, and refuses low
     Object.assign(process.env, saved);
     await fs.rm(lockDir, { recursive: true, force: true });
   }
+});
+
+test('operator lock: a lock directory inside the repository is refused before anything is created', async () => {
+  for (const inside of [path.join(root, '..locks'), path.join(root, 'docs', 'locks')]) {
+    assert.equal(await refusalCode(acquireOperatorLock({ project: 'demo-blitz-store', purpose: 'x', dir: inside })), 'LOCK_DIRECTORY_INSIDE_REPOSITORY');
+    await assert.rejects(fs.access(inside), undefined, inside);
+  }
+});
+
+test('only exit 1 means nothing was written; other outcomes are reported as unresolved', () => {
+  const refused = Object.assign(new StoreRefusal('STORE_CONCURRENT_CHANGE'), { outcome: 'refused-before-write' });
+  const unknown = Object.assign(new StoreRefusal('STORE_OUTCOME_UNKNOWN'), { outcome: 'unknown' });
+  const drift = Object.assign(new StoreRefusal('STORE_ELIGIBILITY_CHANGED_DURING_COMMIT'), { outcome: 'committed-eligibility-changed' });
+  const late = Object.assign(new StoreRefusal('STORE_RECEIPT_FAILED_AFTER_COMMIT'), { outcome: 'committed-verified' });
+  assert.deepEqual([refused, unknown, drift, late].map(exitCodeFor), [1, 3, 4, 5]);
+  assert.equal(failureLine(refused), 'STORE_REFUSED STORE_CONCURRENT_CHANGE');
+  assert.equal(failureLine(new StoreRefusal('STORE_APPROVAL_REQUIRED')), 'STORE_REFUSED STORE_APPROVAL_REQUIRED');
+  assert.equal(failureLine(unknown), 'STORE_UNRESOLVED STORE_OUTCOME_UNKNOWN');
+  assert.equal(failureLine(drift), 'STORE_UNRESOLVED STORE_ELIGIBILITY_CHANGED_DURING_COMMIT');
+  assert.equal(failureLine(late), 'STORE_UNRESOLVED STORE_RECEIPT_FAILED_AFTER_COMMIT');
 });

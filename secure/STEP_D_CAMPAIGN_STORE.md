@@ -36,6 +36,9 @@ This tool writes, replaces or retracts the one owner document the secure shell r
 | 1 | `REFUSED_PRE_WRITE` (or no receipt yet) | Refused before the commit was sent: nothing changed. | Fix the cause; start again from a dry run. |
 | 3 | `OUTCOME_UNKNOWN` | The commit was sent and its result is not known (lost acknowledgement, failed or mismatched readback). `observedDigest` is one read taken afterwards. | **Do not re-run the apply.** Run `inspect`. If the live digest is `intendedDigest`, it committed: use `rollbackIfCommitted` if it must be undone. If it is `expectCurrent`, it did not. Anything else is a concurrent writer: stop for review. |
 | 4 | `COMMITTED_ELIGIBILITY_CHANGED` | Committed and read back, but the owner record changed during the commit. | Review the claim change; undo with `rollbackIfCommitted` if needed. |
+| 5 | `READY_TO_COMMIT` (stale) | Committed and read back, but the final receipt update failed. | Treat as committed; the receipt still holds `rollbackIfCommitted`. |
+
+Exit 1 prints `STORE_REFUSED <code>`. Exits 3, 4 and 5 print `STORE_UNRESOLVED <code>`: something may have changed.
 
 ## Producing the envelope (owner, private machine)
 

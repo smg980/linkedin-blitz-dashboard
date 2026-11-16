@@ -13,6 +13,9 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 export class LockRefusal extends Error {
   constructor(code) {
@@ -27,7 +30,30 @@ export function lockDirectory(env = process.env) {
   return env.BLITZ_OPERATOR_LOCK_DIR || path.join(os.homedir(), '.blitz-operator');
 }
 
+// Real path of `target`, resolving the deepest ancestor that exists.
+async function realpathAllowMissing(target) {
+  const rest = [];
+  let current = path.resolve(target);
+  for (;;) {
+    try {
+      return path.join(await fs.realpath(current), ...rest.reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(target);
+      rest.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
 async function privateDirectory(dir) {
+  // Checked before anything is created: the lock never lives in a checkout.
+  const real = await realpathAllowMissing(dir);
+  const repo = await fs.realpath(REPO_ROOT);
+  const relative = path.relative(repo, real);
+  if (relative === '' || !(relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) {
+    throw new LockRefusal('LOCK_DIRECTORY_INSIDE_REPOSITORY');
+  }
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const info = await fs.lstat(dir);
   if (!info.isDirectory()) throw new LockRefusal('LOCK_DIRECTORY_NOT_A_DIRECTORY');
