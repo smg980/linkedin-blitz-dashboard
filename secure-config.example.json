@@ -1,0 +1,9 @@
+{
+  "firebase": {
+    "apiKey": "REPLACE_WITH_FIREBASE_WEB_API_KEY",
+    "authDomain": "REPLACE_ME.firebaseapp.com",
+    "projectId": "REPLACE_ME",
+    "appId": "REPLACE_WITH_FIREBASE_APP_ID"
+  },
+  "useEmulators": false
+}

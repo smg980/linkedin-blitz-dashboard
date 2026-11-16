@@ -55,3 +55,9 @@ A separate **synthetic-only** Firebase Hosting candidate is prepared for the exi
 Run `npm test` to validate the staging safeguards, or `npm run build:firebase-demo && npm run verify:firebase-demo` to generate and verify the four-contact fictional preview under the Gitignored `.firebase-blitz-demo/` directory. It refuses an inherited production passphrase and never copies `docs/data.enc.json`. Do not publish real outreach data directly to Firebase Hosting: static Hosting files are publicly retrievable.
 
 **Production migration remains gated** on the Meeting Prep Firebase Auth/Firestore authorization review, merged security rules tests, secure access to encrypted data, approved passphrase rotation and separate `hosting:blitz` deployment. See [Firebase Blitz migration plan](docs/FIREBASE_BLITZ_MIGRATION.md). The live GitHub Pages campaign remains the rollback.
+
+## Private shell
+
+`npm run build:secure-shell -- --emulator` builds a separate Hosting shell with placeholder Firebase config and no campaign file. `npm run verify:secure-shell` fails if that output contains ciphertext or the fictional contact names. A real web config stays in untracked `secure-config.local.json` (see `secure-config.example.json`). `npm run test:secure` checks the shell against local emulators and the four fictional contacts only.
+
+Loading real campaign data is a separate approved step. This repository does not deploy the private shell, and `scripts/deploy-firebase-demo.sh` is unchanged. See [secure/README.md](secure/README.md).

@@ -1,0 +1,16 @@
+.gate-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:16px}
+.gate-actions .btn,.pass-row .btn,.top-actions .btn{min-height:44px}
+#pass{font-size:16px}
+.private-note{margin:12px 0 0;color:var(--muted);font-size:13px}
+.hero .fine{margin-top:14px}
+.card h3,.card p,.panel h2,.hero h2{overflow-wrap:anywhere}
+.card{min-width:0}
+@media (max-width:600px){
+  .lock{padding:12px}
+  .lock-card{padding:24px 14px}
+  .brand-logo--lock img{width:min(200px,100%);max-width:100%;height:auto}
+  .pass-row{flex-wrap:wrap}
+  .pass-row .btn{flex:1 1 auto}
+  .top-actions{flex-wrap:wrap;justify-content:flex-end}
+  .content,.panel,.card,.hero,.hero>div{min-width:0;max-width:100%}
+}
