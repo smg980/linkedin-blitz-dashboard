@@ -20,6 +20,10 @@
 //   weak-csp | no-xfo | report-only | dup-csp | redirect | cdn-mismatch | missing-404
 //                         the live site differs from the approved release after deploy
 //   baseline-<mode>       (shell baseline only) the same faults on the live baseline
+//   live-is-demo          shell baseline requested, but the fictional demo is live
+//   cipher-live           shell baseline, but /data.enc.json is still served
+//   wrong-release         the operator-supplied release is not the live one
+//   demo-baseline-shell-live  demo baseline requested while a shell is live
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
@@ -232,7 +236,7 @@ if (url === api + '/channels/live') {
   }
 } else if (url && url.startsWith(origin + '/')) {
   const name = url === origin + '/' ? 'index.html' : decodeURIComponent(url.slice(origin.length + 1));
-  const demoLive = !deployed && baseline === 'demo';
+  const demoLive = !deployed && (baseline === 'demo' || mode === 'live-is-demo');
   const dir = deployed ? path.join(env.STUB_STATE, 'live-files') : (demoLive ? env.STUB_DEMO_DIR : env.STUB_PRE_DIR);
   const fault = deployed ? mode : (mode.startsWith('baseline-') ? mode.slice('baseline-'.length) : '');
   const file = path.join(dir, name);
@@ -291,7 +295,9 @@ export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell } =
     }
     const operatorConfig = path.join(work, 'secure-config.local.json');
     await writeFile(operatorConfig, JSON.stringify(webConfig()), { mode: 0o600 });
-    const preDir = baseline === 'shell' ? await buildShell(work, 'AIzaSyPREVIOUSLIVESHELLKEY0000000000000') : demoDir;
+    // What is live before the deploy, independent of what the operator asked for.
+    const preIsShell = baseline === 'shell' || mode === 'demo-baseline-shell-live';
+    const preDir = preIsShell ? await buildShell(work, 'AIzaSyPREVIOUSLIVESHELLKEY0000000000000') : demoDir;
     const sites = path.join(work, 'sites.json');
     await writeFile(sites, JSON.stringify({
       status: 'success',
@@ -314,7 +320,7 @@ export async function runDeploy({ mode = 'ok', baseline = 'demo', buildShell } =
       BLITZ_SECURE_CONFIG: operatorConfig,
       TMPDIR: tmp,
       STUB_MODE: mode,
-      STUB_BASELINE: baseline,
+      STUB_BASELINE: preIsShell && mode !== 'live-is-demo' ? 'shell' : 'demo',
       STUB_STATE: state,
       STUB_SITES: sites,
       STUB_FIREBASE_LOG: logs.firebase,
