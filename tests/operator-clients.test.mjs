@@ -71,6 +71,37 @@ const writeEnv = (h) => ({
   BLITZ_STORE_UID: UID, BLITZ_STORE_CONFIRM_UID: UID, BLITZ_STORE_APPROVAL: `WRITE:${digest}`, BLITZ_OPERATOR_LOCK_DIR: h.lockDir,
 });
 
+test('R4 executor: real pinned SDK Commit settles once before authorizing CLEAN', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  const h = await harness();
+  let settled = 0;
+  try {
+    const result = await main(writeArgs(h, path.join(h.work, 'receipt.json')), writeEnv(h), {
+      ...h.deps, executorSession: { started() {}, settled() { settled++; } },
+    });
+    assert.equal(result.outcome, 'committed-verified');
+    assert.equal(h.firestore.state.commits.length, 1);
+    assert.equal(settled, 1);
+  } finally { await h.close(); }
+});
+
+test('R4 executor: lost Commit acknowledgement retains outcome and never authorizes CLEAN', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
+  let grpcStatus;
+  const h = await harness({ commitFault: (_attempt, _request, apply) => {
+    apply(); return { code: grpcStatus.UNAVAILABLE, details: 'synthetic lost ack' };
+  } });
+  grpcStatus = h.firestore.grpcStatus;
+  let settled = 0;
+  try {
+    const error = await main(writeArgs(h, path.join(h.work, 'receipt.json')), writeEnv(h), {
+      ...h.deps, executorSession: { started() {}, settled() { settled++; } },
+    }).catch((error) => error);
+    assert.equal(error.outcome, 'unknown');
+    assert.equal(error.cleanupComplete, false);
+    assert.equal(h.firestore.state.commits.length, 1);
+    assert.equal(settled, 0);
+  } finally { await h.close(); }
+});
+
 test('R3: production inspect initializes Auth and Firestore from the checked user credential', { skip: !HAVE_OPENSSL && 'openssl unavailable' }, async () => {
   const h = await harness();
   try {

@@ -290,6 +290,27 @@ export async function main(argv = process.argv.slice(2), env = process.env, deps
   const uid = env.BLITZ_STORE_UID;
   campaignPath(uid);
   if (opts.action === 'write') need(opts.input, 'STORE_INPUT_REQUIRED');
+  if (opts.apply && !deps.executorSession && !deps.testTransport) {
+    const { requestExecutor } = await import('../secure/executor-client.mjs');
+    let response;
+    try { response = await requestExecutor('campaign', argv, env); }
+    catch (error) {
+      const refusal = new StoreRefusal(error.outcome === 'unknown' ? 'STORE_OUTCOME_UNKNOWN' : 'STORE_EXECUTOR_UNAVAILABLE');
+      if (error.outcome) refusal.outcome = error.outcome;
+      if (error.cleanupComplete === false) Object.assign(refusal, { cleanupComplete: false,
+        quarantine: 'ACTIVE_OR_UNCONFIRMED', cleanupFailures: ['EXECUTOR_CONNECTION_LOST'] });
+      throw refusal;
+    }
+    const metadata = { quarantine: response.quarantine,
+      ...(response.cleanupComplete === false ? { cleanupComplete: false,
+        cleanupFailures: [...new Set([...(response.error?.cleanupFailures || response.result?.cleanupFailures || []),
+          ...(response.cleanupFailures || []), 'EXECUTOR_QUARANTINED'])] } : {}) };
+    if (response.error) {
+      const error = Object.assign(new StoreRefusal(response.error.code), response.error, metadata);
+      throw error;
+    }
+    return { ...response.result, ...metadata };
+  }
   const input = opts.action === 'write' ? await resolveInput(opts.input) : null;
   // R6: both directories are anchored now and held for the whole run.
   const anchors = [];
@@ -315,6 +336,12 @@ async function runWithAnchors({ opts, env, deps, input, uid, backupEntry, receip
   const backupPath = backupEntry ? backupEntry.target : opts.backup;
   const receiptPath = receiptEntry ? receiptEntry.target : undefined;
   const writers = anchoredWriters({ backup: backupEntry, receipt: receiptEntry });
+
+  if (deps.executorSession) {
+    const { runOwnedCampaign } = await import('../secure/owned-campaign-execution.mjs');
+    return runOwnedCampaign({ opts, env, deps, input, uid, writers, backupPath, receiptPath,
+      loadCredential: loadOperatorCredential, bindIdentity: bindOperatorIdentity });
+  }
 
   // Coordinated operator control: no claim tool or second store run may
   // overlap a mutation for this project.
@@ -468,16 +495,21 @@ function cleanupSuffix(failures) {
   return codes.length ? ` ${codes.join(' ')}` : '';
 }
 
+function quarantineSuffix(value) {
+  return ['CLEAN', 'ACTIVE', 'ACTIVE_OR_UNCONFIRMED'].includes(value?.quarantine)
+    ? ` QUARANTINE=${value.quarantine}` : '';
+}
+
 export function failureLine(error) {
   const code = error instanceof StoreRefusal ? error.code : 'STORE_OPERATION_FAILED';
   const cleanup = error?.cleanupComplete === false ? ` CLEANUP_INCOMPLETE${cleanupSuffix(error.cleanupFailures)}` : '';
-  return `${exitCodeFor(error) === 1 ? 'STORE_REFUSED' : 'STORE_UNRESOLVED'} ${code}${cleanup}`;
+  return `${exitCodeFor(error) === 1 ? 'STORE_REFUSED' : 'STORE_UNRESOLVED'} ${code}${cleanup}${quarantineSuffix(error)}`;
 }
 
 // R4: printed on stderr beside a successful JSON result whose cleanup did not
 // complete. The outcome on stdout stands; the run did not finish cleanly.
 export function cleanupIncompleteLine(result) {
-  return `STORE_CLEANUP_INCOMPLETE${cleanupSuffix(result?.cleanupFailures)} outcome=${/^[a-z-]{1,40}$/.test(result?.outcome || '') ? result.outcome : (result?.dryRun ? 'dry-run' : 'unreported')} do-not-rerun-apply`;
+  return `STORE_CLEANUP_INCOMPLETE${cleanupSuffix(result?.cleanupFailures)} outcome=${/^[a-z-]{1,40}$/.test(result?.outcome || '') ? result.outcome : (result?.dryRun ? 'dry-run' : 'unreported')}${quarantineSuffix(result)} do-not-rerun-apply`;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -1,16 +1,9 @@
 #!/usr/bin/env node
-// Holds the per-project operator lock while a human changes owner claims (D0),
-// so a Step D store run cannot overlap it. See secure/D0_OWNER_ACCESS.md.
-//
-//   node scripts/blitz-operator-lock.mjs hold   --project <id> [--purpose d0-claims]
-//   node scripts/blitz-operator-lock.mjs status --project <id>
-//
-// The lock is released when this process gets Enter, end of input, SIGINT or
-// SIGTERM. It never removes a lock it did not create.
-import fs from 'node:fs/promises';
+// Manual hold/status used the obsolete O_EXCL protocol. A manual claim command
+// can outlive its lock holder, so this command cannot authorize a safe release
+// or report executor occupancy from a pathname. Use only the trusted executor.
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { acquireOperatorLock, lockDirectory } from '../secure/operator-lock.mjs';
 
 function parse(argv) {
   const [command, ...rest] = argv;
@@ -26,26 +19,8 @@ function parse(argv) {
 }
 
 async function main(argv) {
-  const opts = parse(argv);
-  if (opts.command === 'status') {
-    const file = path.join(lockDirectory(), `${opts.project}.lock`);
-    const held = await fs.lstat(file).then(() => true, () => false);
-    console.log(held ? 'OPERATOR_LOCK held' : 'OPERATOR_LOCK free');
-    return;
-  }
-  const lock = await acquireOperatorLock({ project: opts.project, purpose: opts.purpose, dir: lockDirectory() });
-  console.log('OPERATOR_LOCK held. Keep this running while claims change; press Enter to release.');
-  await new Promise((resolve) => {
-    const done = () => resolve();
-    process.once('SIGINT', done);
-    process.once('SIGTERM', done);
-    process.stdin.once('data', done);
-    process.stdin.once('end', done);
-    process.stdin.resume();
-  });
-  await lock.release();
-  console.log('OPERATOR_LOCK released');
-  process.exit(0);
+  parse(argv);
+  throw new Error('LOCK_USE_TRUSTED_EXECUTOR');
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
