@@ -8,7 +8,7 @@ import { checkSecureShell } from '../scripts/secure-browser-check.mjs';
 import { decryptEnvelope } from '../secure/envelope.mjs';
 import { assertEmulatorTarget } from '../secure/emulator-guard.mjs';
 import { envelopeFromFirestoreFields } from '../secure/firestore-get.mjs';
-import { runSyntheticOwnerAction } from '../scripts/d0-owner-emulator.mjs';
+import { runSyntheticOwnerAction } from './helpers/owned-emulator-actions.mjs';
 import { isCredentialEnvKey } from '../secure/campaign-store.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');

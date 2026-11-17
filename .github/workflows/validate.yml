@@ -76,6 +76,10 @@ jobs:
           node --check tests/campaign-store.integration.mjs
       - name: Run synthetic-only tests
         run: npm test
+      - name: Run R4 protected admission and trusted executor regressions
+        run: |
+          sudo env "PATH=$PATH" python3 tests/operator-quarantine.test.py
+          sudo env "PATH=$PATH" python3 tests/trusted-executor-supervisor.test.py
       - name: Verify committed encrypted GitHub Pages bundle
         run: npm run verify:bundle
       - name: Verify isolated Firebase demo staging output

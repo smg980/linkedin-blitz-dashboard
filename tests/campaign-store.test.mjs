@@ -21,7 +21,7 @@ import {
   PRODUCTION_PROJECT,
   runStoreAction,
 } from '../secure/campaign-store.mjs';
-import { outsideRepository, parseArgs, writeBackupFile } from '../scripts/blitz-campaign-store.mjs';
+import { main, outsideRepository, parseArgs, writeBackupFile } from '../scripts/blitz-campaign-store.mjs';
 import { encryptEnvelope } from '../secure/envelope.mjs';
 import { syntheticPayload } from '../secure/synthetic-contacts.mjs';
 
@@ -323,6 +323,8 @@ test('CLI refuses before loading the Admin SDK and prints only fixed codes', asy
     // Port 9 is discard; any SDK call would fail differently from these fixed codes.
     const loop = { FIRESTORE_EMULATOR_HOST: '127.0.0.1:9', FIREBASE_AUTH_EMULATOR_HOST: '127.0.0.1:9', BLITZ_STORE_UID: secretUid };
     const emu = ['--target', 'emulator', '--project', 'demo-blitz-store'];
+    // Apply validates paths in the worker. A private in-process capability
+    // tests those early refusals; real CLI/OS admission is tested on Linux.
     const cases = [
       [['write', '--target', 'production', '--project', PRODUCTION_PROJECT, '--input', synthetic], { CI: 'true', BLITZ_STORE_UID: secretUid }, 'STORE_NEVER_FROM_CI'],
       [['inspect', '--target', 'production', '--project', PRODUCTION_PROJECT], { CI: 'true', BLITZ_STORE_UID: secretUid }, 'STORE_NEVER_FROM_CI'],
@@ -339,6 +341,14 @@ test('CLI refuses before loading the Admin SDK and prints only fixed codes', asy
       [['write', ...emu, '--input', synthetic, '--backup', path.join(dir, 'nodir', 'b.json'), '--apply'], loop, 'STORE_BACKUP_DIRECTORY_MISSING'],
     ];
     for (const [args, env, code] of cases) {
+      if (args.includes('--apply')) {
+        let started = false;
+        await assert.rejects(main(args, env, { executorSession: {
+          started() { started = true; throw new Error('UNEXPECTED_SDK_START'); },
+        } }), { code });
+        assert.equal(started, false);
+        continue;
+      }
       const result = cli(args, env);
       assert.equal(result.status, 1, `${code}: ${result.stdout}${result.stderr}`);
       assert.equal(result.stderr.trim(), `STORE_REFUSED ${code}`, args.join(' '));

@@ -230,7 +230,7 @@ function cleanEnv(extra) {
   return { ...env, ...extra };
 }
 
-test('claim race control: a store apply refuses while a claim change holds the lock, before writing anything', async () => {
+test('R4: a legacy lock never substitutes for protected executor admission', async () => {
   const dir = await tempDir('blitz-store-lock-');
   const lockDir = path.join(dir, 'locks');
   try {
@@ -243,10 +243,10 @@ test('claim race control: a store apply refuses while a claim change holds the l
         '--input', input, '--expect-current', 'none', '--receipt', path.join(dir, 'receipt.json'), '--apply',
       ], {
         cwd: root, encoding: 'utf8', timeout: 20000,
-        env: cleanEnv({ FIRESTORE_EMULATOR_HOST: '127.0.0.1:9', FIREBASE_AUTH_EMULATOR_HOST: '127.0.0.1:9', BLITZ_STORE_UID: 'syntheticOwnerUid01', BLITZ_OPERATOR_LOCK_DIR: lockDir }),
+        env: cleanEnv({ FIRESTORE_EMULATOR_HOST: '127.0.0.1:9', FIREBASE_AUTH_EMULATOR_HOST: '127.0.0.1:9', BLITZ_STORE_UID: 'syntheticOwnerUid01', BLITZ_OPERATOR_LOCK_DIR: lockDir, BLITZ_EXECUTOR_SOCKET: path.join(dir, 'missing.sock') }),
       });
       assert.equal(result.status, 1);
-      assert.equal(result.stderr.trim(), 'STORE_REFUSED STORE_OPERATOR_LOCK_HELD');
+      assert.equal(result.stderr.trim(), 'STORE_REFUSED STORE_EXECUTOR_UNAVAILABLE');
       await assert.rejects(fs.access(path.join(dir, 'receipt.json')));
     } finally {
       await held.release();
@@ -256,17 +256,18 @@ test('claim race control: a store apply refuses while a claim change holds the l
   }
 });
 
-test('claim race control: the D0 claim tool takes the same lock, and refuses lower-case credential variables', async () => {
+test('R4: D0 requires the protected executor and refuses lower-case credential variables', async () => {
   const lockDir = await tempDir('blitz-d0-lock-');
   const saved = { ...process.env };
   try {
     for (const key of Object.keys(process.env)) if (isCredentialEnvKey(key)) delete process.env[key];
     process.env.FIREBASE_AUTH_EMULATOR_HOST = '127.0.0.1:9';
     process.env.BLITZ_OPERATOR_LOCK_DIR = lockDir;
+    process.env.BLITZ_EXECUTOR_SOCKET = path.join(lockDir, 'missing.sock');
     const options = { projectId: 'demo-blitz-secure', uid: 'synthetic-owner', action: 'grant', apply: true, confirmUid: 'synthetic-owner', approval: 'APPLY_SYNTHETIC_ONLY' };
     const held = await acquireOperatorLock({ project: 'demo-blitz-secure', purpose: 'store-write', dir: lockDir });
     try {
-      await assert.rejects(runSyntheticOwnerAction(options), /D0_OPERATOR_LOCK_HELD/);
+      await assert.rejects(runSyntheticOwnerAction(options), /EXECUTOR_UNAVAILABLE/);
     } finally {
       await held.release();
     }

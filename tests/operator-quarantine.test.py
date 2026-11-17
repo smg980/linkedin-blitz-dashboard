@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 SOURCE = Path(__file__).resolve().parents[1] / 'secure/operator-quarantine.py'
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('operator_quarantine', SOURCE)
 q = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(q)
@@ -173,6 +174,20 @@ class QuarantineTests(unittest.TestCase):
             with self.assertRaises(q.QuarantineError) as error:
                 self.a.release()
         self.assertFalse(error.exception.cleanup_complete)
+        self.refused()
+
+    def test_close_reports_both_control_descriptor_failures(self):
+        self.a.acquire()
+        close = os.close
+        def fail(fd):
+            close(fd)
+            raise OSError('synthetic')
+        with patch.object(q.os, 'close', side_effect=fail):
+            with self.assertRaises(q.QuarantineError) as error:
+                self.a.close()
+        self.assertFalse(error.exception.cleanup_complete)
+        self.assertEqual(error.exception.cleanup_failures,
+                         ['LOCK_RELEASE_UNCONFIRMED', 'LOCK_DIRECTORY_CLOSE_UNCONFIRMED'])
         self.refused()
 
     def test_state_corruption_and_missing_state_refuse(self):

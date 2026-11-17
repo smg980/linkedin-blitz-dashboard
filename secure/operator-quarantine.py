@@ -1,8 +1,8 @@
-"""R4 admission core. Not wired to the campaign CLI; see R4_QUARANTINE.md.
+"""R4 protected admission state. See R4_QUARANTINE.md.
 
 Only a trusted service identity may import this module against its control
 directory. Ordinary clients must never get these descriptors or filesystem
-permissions. There is deliberately no CLEAN/reset/recovery operation.
+permissions. There is no ordinary-client CLEAN/reset/recovery operation.
 """
 import fcntl
 import json
@@ -21,9 +21,9 @@ class QuarantineError(RuntimeError):
 class Admission:
     """One pre-provisioned project, permanent flock inode, private state.
 
-    CLEAN is an initial offline provisioning record, not a lease. Every grant
-    consumes it permanently until a separate reviewed reconciliation exists.
-    This intentionally provides safety without claiming automatic reuse.
+    CLEAN is not a lease. ACTIVE survives release and death. Only the protected
+    supervisor's private settlement path can restore CLEAN for the current
+    session. An abandoned ACTIVE session has no automatic recovery operation.
     """
     LOCK = 'operator.lock'
     STATE = 'state.json'
@@ -156,11 +156,65 @@ class Admission:
                 raise QuarantineError('LOCK_RELEASE_UNCONFIRMED',
                                       cleanup_complete=False) from None
 
+    def _settled_by_trusted_executor(self):
+        """Service-internal only; never expose this method through client IPC.
+
+        The supervisor must first validate its private child's settlement frame,
+        successful shutdown and exit, and the live request connection. A PID or
+        an ordinary client report alone cannot authorize this call.
+        """
+        if self.closed or self.lock_fd < 0 or self.session is None:
+            raise QuarantineError('LOCK_SESSION_INVALID')
+        fd = os.open(self.STATE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=self.directory_fd)
+        try:
+            self._regular(fd)
+            raw = os.read(fd, self.LIMIT + 1)
+            expected = {'version': 1, 'state': 'ACTIVE', 'session': self.session}
+            if len(raw) > self.LIMIT or json.loads(raw) != expected:
+                raise QuarantineError('LOCK_SESSION_INVALID')
+        finally:
+            os.close(fd)
+        self._persist_trusted_state({'version': 1, 'state': 'CLEAN'})
+
+    def _retain_active_after_lost_reply(self):
+        if self.closed or self.lock_fd < 0 or self.session is None:
+            raise QuarantineError('LOCK_SESSION_INVALID')
+        self._persist_trusted_state({'version': 1, 'state': 'ACTIVE', 'session': self.session})
+
+    def _persist_trusted_state(self, value):
+        name = '.transition-' + secrets.token_hex(32)
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                     os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.directory_fd)
+        try:
+            payload = json.dumps(value, separators=(',', ':')).encode()
+            offset = 0
+            while offset < len(payload):
+                count = os.write(fd, payload[offset:])
+                if count <= 0:
+                    raise OSError('short write')
+                offset += count
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(name, self.STATE, src_dir_fd=self.directory_fd,
+                  dst_dir_fd=self.directory_fd)
+        os.fsync(self.directory_fd)
+
     def close(self):
         self.closed = True
+        failures = []
         try:
             self.release()
-        finally:
-            if self.directory_fd >= 0:
-                fd, self.directory_fd = self.directory_fd, -1
+        except Exception:
+            failures.append('LOCK_RELEASE_UNCONFIRMED')
+        if self.directory_fd >= 0:
+            fd, self.directory_fd = self.directory_fd, -1
+            try:
                 os.close(fd)
+            except OSError:
+                failures.append('LOCK_DIRECTORY_CLOSE_UNCONFIRMED')
+        if failures:
+            error = QuarantineError('LOCK_CLEANUP_UNCONFIRMED', cleanup_complete=False)
+            error.cleanup_failures = failures
+            raise error

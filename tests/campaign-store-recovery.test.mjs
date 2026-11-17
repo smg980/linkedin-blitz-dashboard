@@ -8,7 +8,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { assertTarget, envelopeDigest, isCredentialEnvKey, PRODUCTION_PROJECT, runStoreAction } from '../secure/campaign-store.mjs';
-import { outsideRepository } from '../scripts/blitz-campaign-store.mjs';
+import { main, outsideRepository } from '../scripts/blitz-campaign-store.mjs';
 import { encryptEnvelope } from '../secure/envelope.mjs';
 import { syntheticPayload } from '../secure/synthetic-contacts.mjs';
 
@@ -208,6 +208,8 @@ test('F5: inputs and backups inside the repository are refused through ..names, 
     await fs.symlink(path.join(root, '..campaign.json'), linkToRepoFile);
     const linkToDocs = path.join(dir, 'docs-link');
     await fs.symlink(path.join(root, 'docs'), linkToDocs, 'dir');
+    // Apply path checks run inside the trusted worker; exercise that private
+    // entry point without installing an OS service for these early refusals.
     const cases = [
       [['write', ...emu, '--input', path.join(root, '..private', 'campaign.json')], 'STORE_INPUT_INSIDE_REPOSITORY'],
       [['write', ...emu, '--input', path.join(root, '..campaign.json')], 'STORE_INPUT_INSIDE_REPOSITORY'],
@@ -219,6 +221,14 @@ test('F5: inputs and backups inside the repository are refused through ..names, 
       [['write', ...emu, '--input', synthetic, '--backup', path.join(linkToDocs, 'b.json'), '--apply'], 'STORE_BACKUP_INSIDE_REPOSITORY'],
     ];
     for (const [args, code] of cases) {
+      if (args.includes('--apply')) {
+        let started = false;
+        await assert.rejects(main(args, loop, { executorSession: {
+          started() { started = true; throw new Error('UNEXPECTED_SDK_START'); },
+        } }), { code });
+        assert.equal(started, false);
+        continue;
+      }
       const result = cli(args, loop);
       assert.equal(result.stderr.trim(), `STORE_REFUSED ${code}`, `${args.join(' ')}\n${result.stdout}${result.stderr}`);
       assert.equal(result.status, 1);

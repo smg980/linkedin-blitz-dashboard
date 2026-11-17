@@ -97,7 +97,7 @@ const ts = () => ({ seconds: String(Math.floor(Date.now() / 1000)), nanos: 0 });
 
 // commitFault(n, request, apply) lets a test decide what Commit attempt n does:
 // return null to succeed, or a gRPC status object to fail (after or before apply()).
-export async function startFirestoreServer({ tls: tlsMaterial, initialFields = null, commitFault = null, onBatchGet = null }) {
+export async function startFirestoreServer({ tls: tlsMaterial, initialFields = null, commitFault = null, onBatchGet = null, expectedToken = SYNTHETIC_ACCESS_TOKEN }) {
   const { grpc, loader, protos } = grpcModules();
   const definition = loader.loadSync('google/firestore/v1/firestore.proto', {
     includeDirs: protos, keepCase: false, longs: String, enums: String, defaults: true, oneofs: true,
@@ -107,7 +107,7 @@ export async function startFirestoreServer({ tls: tlsMaterial, initialFields = n
   const authorized = (call) => {
     const header = call.metadata.get('authorization')[0];
     state.authorizations.push(header);
-    return header === `Bearer ${SYNTHETIC_ACCESS_TOKEN}`;
+    return header === `Bearer ${expectedToken}`;
   };
   const deny = { code: grpc.status.UNAUTHENTICATED, details: 'synthetic transport: unexpected credential' };
   const server = new grpc.Server();
@@ -124,7 +124,7 @@ export async function startFirestoreServer({ tls: tlsMaterial, initialFields = n
       call.write(message);
       call.end();
     },
-    commit(call, callback) {
+    async commit(call, callback) {
       if (!authorized(call)) { callback(deny); return; }
       const attempt = state.commits.length + 1;
       state.commits.push(structuredClone({ writes: call.request.writes.map((w) => w.operation), transaction: String(call.request.transaction) }));
@@ -134,7 +134,7 @@ export async function startFirestoreServer({ tls: tlsMaterial, initialFields = n
           else if (write.update) state.fields = write.update.fields;
         }
       };
-      const fault = commitFault ? commitFault(attempt, call.request, apply) : (apply(), null);
+      const fault = commitFault ? await commitFault(attempt, call.request, apply) : (apply(), null);
       if (fault) { callback(fault); return; }
       callback(null, { writeResults: call.request.writes.map(() => ({ updateTime: ts() })), commitTime: ts() });
     },
@@ -144,7 +144,8 @@ export async function startFirestoreServer({ tls: tlsMaterial, initialFields = n
     },
   });
   const port = await new Promise((resolve, reject) => {
-    server.bindAsync('127.0.0.1:0', grpc.ServerCredentials.createSsl(null, [{ private_key: tlsMaterial.key, cert_chain: tlsMaterial.cert }]),
+    const credentials = tlsMaterial ? grpc.ServerCredentials.createSsl(null, [{ private_key: tlsMaterial.key, cert_chain: tlsMaterial.cert }]) : grpc.ServerCredentials.createInsecure();
+    server.bindAsync('127.0.0.1:0', credentials,
       (error, bound) => (error ? reject(error) : resolve(bound)));
   });
   return { state, port, grpcStatus: grpc.status, close: () => new Promise((resolve) => server.tryShutdown(() => resolve())) };

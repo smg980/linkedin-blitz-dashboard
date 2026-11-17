@@ -1,100 +1,128 @@
-# R4 admission core: review scope and remaining blocker
+# R4 trusted executor — candidate for independent review
 
-This is a deliberately incomplete R4 implementation for review, based on
-`c59d11b65e8ca06c8b0d3c2f6e8ea9f3c9d45084`. It is not wired into the existing
-campaign or D0 CLI. Those clients still use the old lock implementation and
-must not be represented as remediated by this commit. R6 is untouched.
+This change builds on `276928803a64814177c8ad4e18b1c8836d879f56`.
+It does not approve production use or resolve R6.
 
-## Implemented transition
+## Authority and admission
 
-`operator-quarantine.py` consumes one offline-provisioned CLEAN state and
-atomically replaces it with ACTIVE before returning admission. It writes a
-new exclusive temporary file, completes all writes, fsyncs and closes it,
-renames it over state.json relative to the pinned control directory, and
-fsyncs that directory. A permanent pre-provisioned operator.lock inode is
-held with nonblocking flock throughout admission. It is never removed,
-replaced or created by this code. Missing or invalid control state refuses.
+Normal campaign apply and D0 apply submit a bounded v1 request to a root-owned
+Unix socket beneath administrator-owned directories. There is no ordinary
+completion, CLEAN, reset, lease expiry, stale-PID recovery or arbitrary-command
+operation. Both supported mutators use the same project control directory.
+The old manual hold/status command refuses: an external claim command could
+outlive that holder, and pathname existence is not executor occupancy.
 
-There is intentionally **no ACTIVE to CLEAN transition**. Kernel release,
-worker death, client shutdown, failed shutdown, unknown outcome, a lost IPC
-response, or process exit cannot reset quarantine. This guarantees the core
-never admits a second mutation after an admitted session, even when a prior
-process or server can still commit. It also blocks reuse after a clean run.
-This availability cost is explicit; it is not a complete reusable lifecycle.
+A socket-activated supervisor authenticates SO_PEERCRED against a fixed caller
+UID. Its root-controlled configuration binds the project, executable, source,
+control directory, executor UID and control UID. All three identities must be
+distinct and unprivileged. Code, dependencies and executable are administrator
+owned and unwritable to either service/client identity. Only immutable file
+symlinks within the code tree are permitted; directory symlinks are refused.
+No Node loader variables or caller-selected program are inherited.
+Set-ID/capability-bearing Node executables are refused. Both service identities
+must have no effective, permitted, inheritable or ambient capabilities after
+the privilege drop; the actual child also checks its configured unprivileged UID.
 
-Partial acquisition never grants admission. A failure after rename can retain
-ACTIVE even without a grant. A failure before rename can retain the previous
-CLEAN state: no mutation was admitted, so a later attempt is safe. Data-file
-fsync failure must not be confused with directory-fsync failure. If a crash
-before directory durability leaves either old CLEAN or new ACTIVE, neither
-permits overlap with an acknowledged grant, since acknowledgement occurs
-only after directory fsync. This assumes the local filesystem honors fsync
-and atomic same-directory rename; power-cut behavior was not tested.
+Root is used only to launch a fixed child under the executor identity and drop
+the supervisor to the control identity. The child initially waits on a private
+pipe and cannot initialize SDK clients before receiving its admission frame.
+After dropping privileges, the supervisor takes flock on the permanent inode,
+atomically persists ACTIVE, and only then sends that frame. Control files live
+under the control UID; backup/receipt operations run under the different
+executor UID. The ordinary caller cannot traverse either private namespace or
+forge a frame on the child/supervisor pipes.
 
-I/O errors report fixed codes and cleanup confirmation separately. Kernel
-close does not change quarantine. The core does not receive, rewrite or infer
-any Firestore outcome. Actual CLI outcome mapping is unchanged and untested
-by these Python tests.
+The existing operator credential checks and R3/R5 client construction remain
+unchanged. The executor identity must own the approved operator ADC and use
+that operator home; the controller has no Google credentials. Configuration
+and any future installation require separate human review. This work installs
+no service, changes no credentials/IAM, and adds no sudo or autonomous rights.
 
-## Control boundary
+## Settlement and CLEAN
 
-The API has only acquire/release/close; no file operations, arbitrary names,
-reset, completion acknowledgement or recovery operation exists. There is one
-control directory per pre-provisioned project, owned by the service identity
-and mode 0700. The entire ancestry is walked through no-follow directory
-descriptors and must be root-owned with no group/other write bits. The
-operator UID must differ from the directory owner. File ownership, privacy,
-regular type and single link are checked. Descriptors are close-on-exec.
+The trusted child accepts only fixed campaign/D0 operations. It constructs and
+owns the SDK clients. Application logic receives sealed, tracked facades,
+never raw clients or raw DocumentSnapshot.ref handles. All request promises,
+including nested transaction reads, are counted. The facade synchronously
+refuses future issuance after the action ends. Existing transaction outcome
+classification is retained separately from cleanup and quarantine status.
 
-The service identity is trusted; the operator must never receive its control
-descriptors or write access. No ordinary data operation may be exposed under
-this hierarchy. A future transport must not accept a caller-selected control
-directory. There is no deployed transport here. ACLs, alternate mount access,
-service-code integrity and supported local filesystem type remain deployment
-preconditions, not properties verified by this library. Do not use this as a
-standalone provisioning validator. Root/privileged interference and malicious
-service code are outside the boundary. No runtime recovery command is provided.
+CLEAN requires: a recognized terminal outcome (or a confirmed pre-write
+refusal), no outstanding requests, irreversible facade sealing, fulfilled
+Firestore termination and Admin app deletion, a matching private settlement
+frame, stdout EOF, and normal child exit. Exit is necessary to exclude future
+issuance; it is never accepted as settlement evidence by itself. A refusal
+before any SDK factory started is also safe to settle after child exit.
 
-## Why automatic CLEAN is still blocked
+Firestore Commit/channel retries remain disabled by the approved R5 settings.
+D0 emulator mutations use one-attempt core HTTP requests because the pinned
+Admin Auth SDK silently retries connection resets, timeouts and 503 responses.
+Read-only Auth lookups still use the SDK. Any unconfirmed mutating response
+retains ACTIVE; a later readback is not used to erase that uncertainty.
+There is no new production claim-mutation endpoint.
 
-The previous design proposed accepting a classified outcome and a successful
-SDK-shutdown report from Node. Under the stricter requirement that ordinary
-clients cannot authorize CLEAN while an old Node process can issue or finish
-a commit, that report is insufficient. A client could report completion too
-early; killing it does not cancel a server-accepted commit. The service cannot
-independently observe settlement through a credential-free filesystem API.
+The authorized ACTIVE-to-CLEAN transition writes a new exclusive control file,
+flushes/closes it, renames it relative to the held directory and fsyncs the
+directory while flock remains held. No transition unlinks the lock inode.
+Kernel-close confirmation is included before reporting a complete reply.
+Unknown outcome, failed shutdown, observed connection loss before settlement,
+missing/invalid proof, worker death or controller death retain ACTIVE.
+A second admission remains blocked even if an old accepted server request can
+finish after either process dies. Ordinary clients cannot recover that state.
 
-A reusable integration therefore needs a trusted executor that controls all
-commit issuance, tracks authoritative terminal results and outstanding work,
-and prevents further requests before authorizing CLEAN. Uncertain requests
-must still remain ACTIVE after executor death. Merely adding pidfd monitoring,
-leases, a shutdown timeout, or another ordinary-client message is insufficient.
-Alternatively, retain one-shot admission indefinitely with no automatic reuse.
-This commit implements only that conservative admission core and does not
-silently choose a recovery authority or change the existing operator workflow.
+The durable CLEAN transition is the settlement linearization point. Loss of
+final reply delivery after that point does not resurrect an old issuer: it is
+already shut down and gone, with a known outcome. The client reports unresolved
+completion and must not automatically retry. A directory-fsync failure can
+leave either old ACTIVE or already-safe CLEAN after reboot; no unacknowledged
+admission can have issued a mutation. Physical power-cut testing is not claimed.
 
-Next engineering step: specify the trusted executor/settlement contract and
-validate it with the actual pinned SDK and a delayed local synthetic Commit
-transport. Then integrate campaign and D0 admission together, preserve
-outcome/cleanup/quarantine as separate fields, and test real shutdown failure,
-unknown Commit outcomes and CLI exits 10/11/13/14/15 before calling R4 fixed.
-No production, deployment, credential or IAM activity is needed for that work.
+## Operational boundary and limitations
 
-## Executed tests
+This is Linux-only. Control storage must be persistent local storage with the
+reviewed fsync/rename/flock guarantees. Missing state refuses; startup must
+never recreate CLEAN automatically. Protect ancestry, ACLs, mount aliases,
+service identities and code integrity in the eventual deployment. The library
+checks ownership/mode/identity but is not an installer or a complete mount/ACL
+auditor. Do not use a checkout or a volatile runtime directory for real state.
 
-`sudo -n python3 tests/operator-quarantine.test.py` in a disposable Linux
-environment, not on an operator or production machine. The suite fails rather
-than skipping when Linux/root boundary-test prerequisites are missing.
+The bootstrap requires isolated Python (`python3 -I`), an already connected
+socket on fd 3 and an immutable configuration path as its sole argument. It
+does not write bytecode into the code tree. No OS service/socket/sudo policy is
+installed here. The configuration fields are version, caller_uid, executor_uid,
+control_uid, control, project, node and home. Existing gcloud must be available
+on the fixed trusted PATH for a production identity check. No credentials were
+created, copied or changed to make a deployment work.
 
-Coverage: actual cross-process kernel contention; SIGKILL of a worker while
-a separate simulated server remains able to finish; quarantine after release;
-file write/fsync/rename and close failures; directory-fsync failure after
-replacement; corrupt, missing and duplicate-key state; absent recovery/data
-APIs; unsafe ancestry and symlink refusal; and admission under nobody while
-daemon is denied access to the control files. The completion-label test checks
-only the absence of a client completion/reset API. It does not execute SDK
-shutdown or IPC. No tests in this suite use Firebase or real campaign data.
+There must be exactly one authoritative control directory per project, and all
+old writers must be reconciled before initial offline CLEAN provisioning.
+All supported mutators must migrate together. Unmanaged Google admin calls,
+compromised trusted identities, root/privileged tracing/mount changes and old
+versions run outside this protocol remain outside the guarantee. Ordinary
+clients are the separate caller UID; arbitrary code under a trusted service
+identity is not an ordinary client. Read-only CLI inspection retains its prior
+behavior and cannot authorize CLEAN. Quarantine recovery is deliberately absent
+and requires a separately reviewed reconciliation design, not one readback,
+a delay or a process check.
 
-Full Node unit and emulator suites have not been run for this isolated core.
-All pre-existing repository files remain unchanged; approved F1/R1/R2/R3/R5
-implementation is preserved byte for byte. No PR should call this an R4 fix.
+The existing in-process dependency hooks remain for trusted synthetic tests;
+they are never deserialized from requests or enabled by argv/environment.
+R6 directory code and its limitations are unchanged. Production remains NO-GO.
+
+## Validation structure
+
+Python admission tests cover persistence failures, corruption, partial grants,
+kernel contention and UID separation. Supervisor tests run in disposable Linux
+under real distinct caller/executor/control identities. They cover delayed
+HTTP and actual pinned-SDK gRPC Commit servers, death of either process while
+an accepted Commit can still finish, lost IPC, repeat admission, rejected reset
+operations and actual CLI exits 10/11/13/14/15. Shutdown/receipt faults are
+injected only into offline root-owned test copies, never through runtime flags.
+
+Pinned SDK tests retain the approved production-credential and Commit-counting
+coverage against local TLS endpoints. Emulator functional tests use private
+in-process executor capabilities to exercise the owned SDK path without
+requiring a privileged service installation. They do not substitute for the
+separate real CLI/socket/OS boundary tests. Exact execution results and revision
+identities belong in the accompanying review evidence; tests alone are not
+independent approval of R4.
